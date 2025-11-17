@@ -1,0 +1,64 @@
+# --- OS мусор ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- IDE/Editor ---
+.vscode/
+.idea/
+
+# --- Python общие ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.cache/
+pip-wheel-metadata/
+
+# --- Виртуальные окружения ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Сборки / артефакты ---
+build/
+dist/
+*.spec
+wheels/
+site/
+htmlcov/
+.coverage*
+coverage.xml
+
+# --- Логи/времянки ---
+logs/
+*.log
+perf_log.txt
+ffmpeg_log.txt
+
+# --- Твои папки/файлы, которые не нужны в гите ---
+Downloads/
+film/
+sandbox/
+browser/
+ffmpeg/           # бинарники FFmpeg
+all_movies.efu
+
+# --- Бинарники глобально ---
+*.exe
+*.dll
+*.pdb
+*.bin
+*.dat
+
+# --- Исключения: оставить в репо ---
+!version.json          # файл для авто-обновлений (в корне)
+!export_movies_index.bat
+!icon.ico

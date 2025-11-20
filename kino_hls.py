@@ -1,4 +1,3 @@
-# kino_hls.py
 import json
 import os
 import random
@@ -9,9 +8,16 @@ import time
 import urllib.parse
 import urllib.request
 import shutil
+import threading  # ← просто импорт, без глобального семафора
 
 if os.name == "nt":
     CREATE_NO_WINDOW = 0x08000000
+else:
+    CREATE_NO_WINDOW = 0  # на *nix просто игнорируется
+
+_FFMPEG_LOCK = threading.Lock()  # пока про запас, если захочешь синхронизировать только лог-файлы
+
+
 def _origin_from_referer(ref: str) -> str:
     try:
         u = urllib.parse.urlsplit(ref or "")
@@ -53,7 +59,7 @@ def _running_inside_vscode() -> bool:
     )
 
 def _run_ffmpeg(cmd) -> int:
-    """Безопасный запуск ffmpeg — полностью изолирован от IDE."""
+    """Безопасный запуск ffmpeg — без окна, лог в уникальный файл, stdin отключён."""
     ffmpeg_bin = cmd[0]
     if not os.path.isfile(ffmpeg_bin):
         alt = shutil.which("ffmpeg")
@@ -67,26 +73,26 @@ def _run_ffmpeg(cmd) -> int:
                 raise FileNotFoundError(f"⚠️ ffmpeg не найден: {ffmpeg_bin}")
 
     try:
-        if os.name == "nt":
-            DETACHED_PROCESS = 0x00000008
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
+        import uuid
+        log_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"ffmpeg_log_{uuid.uuid4().hex}.txt")
 
-            log_path = os.path.join(os.getcwd(), "ffmpeg_log.txt")
-            with open(log_path, "w", encoding="utf-8") as log:
-                proc = sp.Popen(
-                    cmd,
-                    stdout=log,
-                    stderr=sp.STDOUT,
-                    creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                )
-
-            while proc.poll() is None:
-                time.sleep(0.5)
-            return proc.returncode or 0
+        # БОЛЬШЕ НИКАКИХ ГЛОБАЛЬНЫХ СЕМАФОРОВ:
+        with open(log_path, "w", encoding="utf-8") as log:
+            proc = sp.Popen(
+                cmd,
+                stdout=log,
+                stderr=sp.STDOUT,
+                stdin=sp.DEVNULL,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        return proc.wait()
 
     except Exception as e:
         print(f"⚠️ Ошибка запуска ffmpeg: {e}")
         return -1
+
 
 from urllib.parse import quote_plus
 
@@ -667,23 +673,25 @@ def _sniff_hls_with_cdp(driver, timeout: int = 25) -> tuple[str | None, dict | N
 
 
 def _http_get_text(url: str, headers: dict, *, driver=None) -> str:
-    # 0) один раз нормализуем
-    _, hdict = _augment_headers(headers)
     """
     Надёжная загрузка текста плейлиста:
       1) пробуем через JS fetch в браузере (если driver есть);
-      2) затем несколько попыток через urllib с гибким SSL-контекстом и ретраями;
-      3) если urllib дал SSL EOF — ещё раз дёргаем браузерный fetch.
+      2) затем много попыток через urllib с гибким SSL-контекстом и ретраями до 200 OK;
+      3) если всё равно не удалось — ещё одна попытка браузером и осмысленная ошибка.
     """
+    # 0) Нормализуем заголовки один раз
+    _, hdict = _augment_headers(headers)
+
     # 1) сначала через браузер (если доступен)
     if driver is not None:
-        t = _http_get_text_via_browser(driver, url, hdict)  # <— здесь было headers
+        t = _http_get_text_via_browser(driver, url, hdict)
         if isinstance(t, str) and t:
             return t
 
     # 2) urllib c устойчивым SSL-контекстом + ретраи
     import ssl, urllib.error
-    tries = 4
+
+    max_tries = 8          # фактически "до тех пор", но с предохранителем
     last_err = None
 
     # Гибкий SSL (TLS1.2/1.3, игнор неожиданных EOF, ослабленный seclevel)
@@ -694,36 +702,40 @@ def _http_get_text(url: str, headers: dict, *, driver=None) -> str:
         ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
     except Exception:
         pass
-    # Python 3.11+: тихо игнорировать "unexpected EOF" на стороне сервера
     if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
         ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
 
-    _, hdict = _augment_headers(headers)
     req = urllib.request.Request(url, headers=hdict or {})
 
-
-    for attempt in range(1, tries + 1):
+    for attempt in range(1, max_tries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=40, context=ctx) as r:
-                return r.read().decode("utf-8", "ignore")
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+                status = getattr(r, "status", 200)
+                body = r.read().decode("utf-8", "ignore")
+                if 200 <= status < 300:
+                    return body
+                # не 2xx — считаем ошибкой и ретраим
+                last_err = RuntimeError(f"HTTP {status}")
+        except urllib.error.HTTPError as e:
+            # 4xx/5xx — CDN может "передумать", продолжаем ретраи
+            last_err = e
         except urllib.error.URLError as e:
             last_err = e
-            # на SSL EOF пробуем паузу+повтор
-            time.sleep(0.4 * attempt)
-            continue
         except Exception as e:
             last_err = e
-            time.sleep(0.4 * attempt)
-            continue
+
+        # backoff, но с верхней границей, чтобы не уходить в космос
+        time.sleep(min(0.3 * attempt, 3.0))
 
     # 3) финальный резерв — ещё одна попытка браузером
     if driver is not None:
-        t = _http_get_text_via_browser(driver, url, hdict)  # <— здесь тоже было headers
+        t = _http_get_text_via_browser(driver, url, hdict)
         if isinstance(t, str) and t:
             return t
 
     # если сюда дошли — поднимем осмысленную ошибку (чтобы видеть первопричину)
     raise RuntimeError(f"_http_get_text failed for {url}: {last_err}")
+
 
 
 def _http_get_text_via_browser(driver, url: str, headers: dict) -> str | None:
@@ -786,7 +798,7 @@ def _select_video_and_audios(driver, master_url: str, headers: dict):
     text = _http_get_text(master_url, headers, driver=driver)
     if not text:
         print("❌ Не удалось загрузить master.m3u8")
-        return master_url, []
+        return master_url, headers, []
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
@@ -878,91 +890,9 @@ def _select_video_and_audios(driver, master_url: str, headers: dict):
             except Exception:
                 pass
 
-    return best_url or master_url, audios
+    return best_url or master_url, headers, audios
 
 
-def _ffmpeg_copy_mux_all(video_m3u8: str, audios: list, headers: dict, out_path: str) -> int:
-    """
-    Мультиплексируем видео + все внешние аудио без перекодирования.
-    КЛЮЧЕВОЕ: прокидываем -headers для КАЖДОГО входа (-i).
-    """
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-
-    # Готовим строку заголовков (Referer, Cookie, UA — критичны для CDN)
-    hdr, hdict = _augment_headers(headers)
-    ua = hdict.get("User-Agent", "Mozilla/5.0")
-
-
-    # Базовые входные флаги для всех m3u8
-    common_in_flags = [
-        "-rw_timeout", "15000000",  # 15s в микросекундах
-        "-timeout", "15000000",
-        "-http_seekable", "0",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "15",
-         "-http_persistent", "1",  
-        "-allowed_extensions", "ALL",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
-        "-user_agent", ua,
-    ]
-
-    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-nostats", "-loglevel", "error"]
-
-    # ВИДЕО-вход (всегда с -headers перед -i)
-    cmd += common_in_flags + ["-headers", hdr, "-i", video_m3u8]
-
-    # АУДИО-входы (каждый — со своими -headers перед -i)
-    for a in audios:
-        cmd += common_in_flags + ["-headers", hdr, "-i", a["uri"]]
-
-    # Маппинг: одно видео и все аудио
-    cmd += ["-map", "0:v:0"]
-    if audios:
-        for i in range(len(audios)):
-            cmd += ["-map", f"{i+1}:a:0"]
-    else:
-        cmd += ["-map", "0:a?"]
-
-    # Субтитры отбрасываем
-    cmd += ["-map", "-0:s"]
-
-    # Метаданные дорожек
-    for idx, a in enumerate(audios):
-        title = (a.get("name") or "").strip()
-        lang = (a.get("lang") or "und").strip().lower()
-        if len(lang) == 2:
-            lang = {"ru": "rus", "en": "eng", "uk": "ukr", "ua": "ukr"}.get(lang, lang)
-        else:
-            lang = lang[:3]
-        if title:
-            cmd += [f"-metadata:s:a:{idx}", f"title={title}", f"-metadata:s:a:{idx}", f"handler_name={title}"]
-        cmd += [f"-metadata:s:a:{idx}", f"language={lang}"]
-
-    if audios:
-        cmd += ["-disposition:a:0", "default"]
-
-    # Копируем без перекодирования
-    cmd += ["-c", "copy", "-movflags", "+faststart", "-max_muxing_queue_size", "1024", out_path]
-
-    print("[FFMPEG]", " ".join(shlex.quote(x) for x in cmd))
-    return _run_ffmpeg(cmd)
-
-def _ffmpeg_copy(m3u8_url, headers, out_path):
-    headers_str, _ = _augment_headers(headers)
-    cmd = [
-        FFMPEG_BIN,
-        "-y",
-        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
-        "-headers", headers_str,
-        "-allowed_extensions", "ALL",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
-        "-i", m3u8_url,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        out_path,
-    ]
-    return _run_ffmpeg(cmd)
 # ---------- поиски и скачивание ----------
 def _split_title_variants(orig: str) -> list[str]:
     """
@@ -1172,7 +1102,7 @@ def search_first_item_url(driver, title_query: str) -> str | None:
             continue
 
 
-def download_by_item_url(url: str, out_path: str, driver=None) -> bool:
+def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None) -> bool:
     """
     Основная функция скачивания: использует существующий driver, не создавая новое окно Chrome.
     """
@@ -1194,39 +1124,11 @@ def download_by_item_url(url: str, out_path: str, driver=None) -> bool:
         if drv_created:
             _ensure_shown(drv)
 
-        drv.get(url)
-        _wait_challenge_solved(drv, timeout=30)
-
-        # обновим куки после CF
-        try:
-            from kino_parser import save_cookies
-            save_cookies(drv)
-            print("💾 Cookies обновлены после CF/авторизации.")
-        except Exception as e:
-            print(f"⚠️ Не удалось сохранить куки: {e}")
-
-        WebDriverWait(drv, 25).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-
-        _inject_m3u8_sniffer_js(drv)
-        _start_playback(drv)
-        time.sleep(5)
-
-        master, hdrs = _sniff_hls_with_cdp(drv, timeout=10)
-        if master:
-            master = _normalize_to_master(master)
-            master = master.replace(".mp4master.m3u8", ".mp4/master.m3u8")
-            print(f"🛠️ Нормализовано: {master}")
-        else:
-            print("❌ HLS master.m3u8 не найден.")
-            return False
-
-        video_m3u8, audios = _select_video_and_audios(drv, master, hdrs)
-
+        # --- ЕДИНСТВЕННЫЙ вызов, без двойной нагрузки ---
+        video_m3u8, hdrs2, audios = get_hls_info(url, driver=drv)
 
         if not video_m3u8:
-            print("❌ Не удалось выбрать видео-вариант.")
+            print("❌ Не удалось получить HLS.")
             return False
 
         print(f"🎞  Video: {video_m3u8}")
@@ -1235,12 +1137,10 @@ def download_by_item_url(url: str, out_path: str, driver=None) -> bool:
             for a in audios:
                 print(f"   - {a.get('name') or 'Unknown'} [{a.get('lang') or '?'}]  {a['uri']}")
         else:
-            print("🎧 Отдельные аудио не найдены (возможно, звук в видеопотоке).")
+            print("🎧 Отдельные аудио не найдены (возможно звук в видеопотоке).")
 
-        rc = _ffmpeg_copy_mux_all(video_m3u8, audios, hdrs, out_path)
-        ok = rc == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
-        print("✅ Скачано:" if ok else "❌ Ошибка ffmpeg", out_path if ok else "")
-        return ok
+        start_hls_download(video_m3u8, audios, hdrs2.copy(), out_path, status_cb=status_cb)
+        return True
 
     finally:
         if drv_created:
@@ -1273,9 +1173,8 @@ def get_hls_info(url: str, driver=None) -> tuple[str | None, dict | None, list]:
         print("❌ Не найден master.m3u8")
         return None, None, []
 
-    video_m3u8, audios = _select_video_and_audios(driver, master, hdrs)
-
-    return video_m3u8, hdrs, audios
+    video_m3u8, hdrs2, audios = _select_video_and_audios(driver, master, hdrs)
+    return video_m3u8, hdrs2, audios
 
 def _type_and_pick(driver, query: str, wanted_title: str, wanted_year: str | None):
     # поле поиска
@@ -1441,7 +1340,7 @@ def search_and_download(title: str, out_path: str) -> bool:
         master = _normalize_to_master(master)
         master = master.replace(".mp4master.m3u8", ".mp4/master.m3u8")
         print(f"🛠️ Нормализовано: {master}")
-        video_m3u8, audios = _select_video_and_audios(drv, master, hdrs)
+        video_m3u8, hdrs2, audios = _select_video_and_audios(drv, master, hdrs)
 
 
 
@@ -1456,12 +1355,6 @@ def search_and_download(title: str, out_path: str) -> bool:
                 print(f"   - {a.get('name') or 'Unknown'} [{a.get('lang') or '?'}]  {a['uri']}")
         else:
             print("🎧 Отдельные аудио не найдены (возможно, звук в видеопотоке).")
-
-        # 5) ffmpeg
-        rc = _ffmpeg_copy_mux_all(video_m3u8, audios, hdrs, out_path)
-        ok = rc == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
-        print("✅ Скачано:" if ok else "❌ Ошибка ffmpeg", out_path if ok else "")
-        return ok
 
     finally:
         safe_quit(drv)
@@ -1502,20 +1395,14 @@ def search_and_download_with_driver(
             return False
 
         # 4) видео 1080p + все аудио
-        video_m3u8, audios = _select_video_and_audios(drv, master, hdrs)
+        video_m3u8, hdrs2, audios = _select_video_and_audios(drv, master, hdrs)
         if not video_m3u8:
             print(f"[KINO] Не удалось выбрать видео-вариант: {title}")
             return False
 
         # 5) ffmpeg: сначала все дорожки; если не вышло — только видео
-        rc = _ffmpeg_copy_mux_all(video_m3u8, audios, hdrs, out_path)
-        if rc != 0 or not (os.path.isfile(out_path) and os.path.getsize(out_path) > 0):
-            print("[FFMPEG] MUX all failed, fallback to video-only")
-            rc = _ffmpeg_copy(video_m3u8, hdrs, out_path)
-
-        ok = rc == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
-        print("✅ Скачано:" if ok else "❌ Ошибка ffmpeg", out_path if ok else "")
-        return ok
+        start_hls_download(video_m3u8, audios, hdrs.copy(), out_path)
+        return True
     except Exception as e:
         print(f"[KINO] Исключение при скачке '{title}': {e}")
         return False
@@ -1524,7 +1411,7 @@ def search_and_download_with_driver(
 def batch_search_and_download(
     titles: list[str],
     out_dir: str,
-    max_parallel: int = 3,
+    max_parallel: int = 2,
     retries: int = 2,
     sleep_range: tuple[float, float] = (1.6, 2.5),
     cooldown_every: int = 10,
@@ -1586,28 +1473,175 @@ def batch_search_and_download(
     return ok, fail
 import threading
 
-def start_hls_download(video_m3u8: str, audios: list, headers: dict, out_path: str, status_cb=None):
-    """
-    Запускает ffmpeg-загрузку в отдельном потоке (не блокируя GUI).
-    Возвращает Thread.
-    """
-    def _run():
-        try:
-            rc = _ffmpeg_copy_mux_all(video_m3u8, audios, headers, out_path)
-            ok = rc == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
-            msg = f"✅ {os.path.basename(out_path)}" if ok else f"❌ Ошибка загрузки: {os.path.basename(out_path)}"
-            print(msg)
-            if status_cb:
-                status_cb(msg)
-        except Exception as e:
-            msg = f"❌ Исключение ffmpeg: {e}"
-            print(msg)
-            if status_cb:
-                status_cb(msg)
+import threading
+import shutil
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    return t
+
+
+# -------------------------------------------------------------------------
+#  НАДЁЖНЫЙ PYTHON HLS DOWNLOADER (замена ffmpeg-download)
+# -------------------------------------------------------------------------
+import concurrent.futures
+
+def _http_download(url: str, headers: dict, attempt=1, max_tries=50):
+    """Скачивание сегмента с жесткими ретраями до 200 OK."""
+    _, hdict = _augment_headers(headers)
+    import ssl, urllib.error
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try: ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    except: pass
+    if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+        ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
+
+    req = urllib.request.Request(url, headers=hdict)
+
+    for i in range(1, max_tries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+                if 200 <= r.status < 300:
+                    return r.read()
+        except Exception:
+            pass
+        time.sleep(min(0.2 * i, 2))
+
+    raise RuntimeError(f"SEGMENT FAIL: {url}")
+
+
+def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
+                         status_cb=None, label="Видео", workers=8):
+    """
+    Скачивает HLS-видео/аудио в mp4, БЕЗ ffmpeg.
+    """
+    print(f"⬇️ {label}")
+    if status_cb:
+        status_cb(f"⬇️ {label}")
+
+    text = _http_get_text(m3u8_url, headers)
+    base = m3u8_url.rsplit("/", 1)[0]
+
+    segments = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith("#"):
+            segments.append(urllib.parse.urljoin(m3u8_url, ln))
+
+    if not segments:
+        print("❌ Нет сегментов!")
+        return False
+
+    # скачиваем параллельно
+    data = [None] * len(segments)
+    def load(i, url):
+        data[i] = _http_download(url, headers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(load, i, url) for i, url in enumerate(segments)]
+        for f in concurrent.futures.as_completed(futs):
+            pass
+
+    # сохраняем склейку
+    tmp = out_path + ".part"
+    with open(tmp, "wb") as f:
+        for chunk in data:
+            f.write(chunk)
+
+    os.replace(tmp, out_path)
+    print(f"{label} скачано")
+    return True
+
+def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None):
+    """
+    Стойкий режим:
+    1) Python скачивает VIDEO HLS (без ffmpeg)
+    2) Python скачивает все AUDIO HLS
+    3) ffmpeg делает только быстрый MUX
+    """
+
+    def worker():
+        tmp_dir = out_path + ".parts"
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        video_file = os.path.join(tmp_dir, "video.ts")
+        audio_files = []
+        audio_meta = []
+
+        # --- VIDEO ---
+        print("🎞 Скачиваю видео...")
+        ok = _download_hls_stream(video_m3u8, headers, video_file, status_cb, "Видео")
+        if not ok:
+            if status_cb: status_cb("❌ Ошибка видео")
+            return
+
+        # --- AUDIO ---
+        print("🎧 Скачиваю аудио...")
+        for i, a in enumerate(audios):
+            url = a.get("uri") or a.get("url")
+            title = a.get("name") or f"Audio {i+1}"
+            lang = a.get("lang") or "und"
+            if not url:
+                continue
+
+            apath = os.path.join(tmp_dir, f"audio_{i+1}.aac")
+
+            ok = _download_hls_stream(url, headers, apath,
+                                      status_cb, f"Аудио {i+1} ({title})")
+            if ok:
+                audio_files.append(apath)
+                audio_meta.append((title, lang))
+
+        # --- MUX ---
+        base, _ = os.path.splitext(out_path)
+        tmp_out = base + ".mp4.part"
+
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", video_file]
+
+        for ap in audio_files:
+            cmd += ["-i", ap]
+        if not audio_files:
+            print("⚠️ Нет аудиодорожек, MUX только видео.")
+
+        cmd += ["-map", "0:v:0"]
+        for i in range(len(audio_files)):
+            cmd += ["-map", f"{i+1}:a:0"]
+
+        for i, (title, lang) in enumerate(audio_meta):
+            cmd += ["-metadata:s:a:{0}".format(i), f"title={title}"]
+            cmd += ["-metadata:s:a:{0}".format(i), f"language={lang}"]
+
+        if audio_files:
+            cmd += ["-disposition:a:0", "default"]
+
+        cmd += ["-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp_out]
+
+
+        if status_cb:
+            status_cb("🟣 MUX…")
+
+        # для отладки: покажем точную команду ffmpeg
+        cmd_quoted = [f'"{str(c)}"' if " " in str(c) else str(c) for c in cmd]
+        print("🧩 Муксую...")
+        print("MUX CMD:", " ".join(cmd_quoted))
+
+        rc = _run_ffmpeg(cmd)
+        if rc == 0 and os.path.exists(tmp_out):
+            os.replace(tmp_out, out_path)
+            print("✅ Готово!", out_path)
+            if status_cb:
+                status_cb(f"✅ {os.path.basename(out_path)}")
+        else:
+            print(f"❌ Ошибка MUX (rc={rc})")
+            if status_cb:
+                status_cb(f"❌ Ошибка MUX (код {rc})")
+
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    worker() 
+
+
 
 # ---------- хелпер для GUI ----------
 def download_one_title_ui(root, title_text: str, default_name: str | None = None):
@@ -1642,4 +1676,4 @@ def download_one_title_ui(root, title_text: str, default_name: str | None = None
 
 def download_from_item_url(url: str, out_path: str) -> bool:
     # просто переиспользуем готовую реализацию
-    return download_by_item_url(url, out_path)
+    return download_by_item_url(url, out_path, status_cb=None) 

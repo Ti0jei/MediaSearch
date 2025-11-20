@@ -66,43 +66,14 @@ def threaded_save_checked(root, found_files, checked_vars, movie_index, include_
     # --- внутренняя функция обновления GUI через after() ---
     def safe_update(step, *args, **kwargs):
         if root.winfo_exists():
-            root.after(0, lambda: progress.update_progress(step, *args, **kwargs))
+            def _safe_ui_update():
+                if getattr(progress, "alive", False):
+                    try:
+                        progress.update_progress(step, *args, **kwargs)
+                    except Exception:
+                        pass
 
-    # --- фоновая задача ---
-    def task():
-        for i, file_path in enumerate(files_to_copy):
-            if progress.cancelled:  # ← обработка отмены
-                safe_update(i, current_file="Отменено пользователем")
-                break
-
-            dst_path = os.path.join(dest, os.path.basename(file_path))
-            try:
-                copied, speed = copy_single_file(
-                    file_path,
-                    dst_path,
-                    progress_callback=None,
-                    file_index=i,
-                    total_files=len(files_to_copy),
-                )
-
-                safe_update(
-                    i + 1,
-                    current_file=file_path,
-                    copied_bytes=copied,
-                    total_bytes=os.path.getsize(file_path),
-                    speed=speed,
-                )
-
-            except Exception as e:
-                logging.exception(f"Ошибка при копировании {file_path}: {e}")
-                safe_update(i + 1, current_file=file_path)
-                continue
-
-        root.after(0, progress.close)
-
-    threading.Thread(target=task, daemon=True).start()
-
-
+            root.after(0, _safe_ui_update)
 
     # Подсчёт суммарного объёма и размеров каждого файла — в фоне
     total_bytes = 0
@@ -134,8 +105,8 @@ def threaded_save_checked(root, found_files, checked_vars, movie_index, include_
         current_copied = already + copied
         status = f"{copied / 1024 / 1024:.2f} MB из {total / 1024 / 1024:.2f} MB @ {speed:.2f} MB/s"
 
-        progress.update_progress(
-            step=file_index + 1,
+        safe_update(
+            file_index + 1,
             current_file=filename,
             status_text=status,
             copied_bytes=current_copied,
@@ -143,17 +114,19 @@ def threaded_save_checked(root, found_files, checked_vars, movie_index, include_
             speed=speed,
         )
 
+
     # Основная фоновая задача копирования
     def task():
         for i, file_path in enumerate(files_to_copy):
             # если нажата «Отмена» — выходим из цикла
             if getattr(progress, "cancelled", False):
-                progress.update_progress(
-                    step=i + 1,
+                safe_update(
+                    i + 1,
                     current_file="Отменено пользователем",
                     status_text=""
                 )
                 break
+
 
             filename = os.path.basename(file_path)
             dst_path = os.path.join(dest, filename)
@@ -167,11 +140,16 @@ def threaded_save_checked(root, found_files, checked_vars, movie_index, include_
                     total_files=len(files_to_copy),
                 )
             except Exception as e:
-                progress.update_progress(
-                    step=i + 1, current_file=filename, status_text=f"Ошибка: {e}"
+                safe_update(
+                    i + 1,
+                    current_file=filename,
+                    status_text=f"Ошибка: {e}"
                 )
 
+
         # Закрываем окно (ProgressWindow сам покажет «Готово»/анимацию, если так настроено)
-        progress.close()
+                
+        root.after(0, progress.close)
+
 
     threading.Thread(target=task, daemon=True).start()

@@ -4,12 +4,16 @@ import logging
 import tkinter as tk
 from auto_update import check_for_updates_async
 from download_manager import DownloadManager
+from uc_driver import DriverPool
 from tkinter import messagebox, filedialog
 from pathlib import Path
 from file_actions import export_and_load_index, normalize_name
 from file_actions import load_index_from_efu
 from threaded_tasks import threaded_save_checked
+from kino_pub_downloader import login_to_kino as real_login_to_kino
 from urllib.parse import urljoin
+
+
 SHOW_QUEUE_CONTROLS = False  # скрыть блок: Импорт списка / Удалить / Запустить всё / Остановить
 # --- Режим окна при старте ---
 START_MAXIMIZED  = True   # развернуть на весь экран (обычный «максимизированный» режим)
@@ -316,7 +320,7 @@ def main():
 
     tk.Frame(main_menu, bg=BORDER, height=1).place(relx=0, rely=1.0, 
                                                    relwidth=1.0, y=-26, anchor="sw")
-    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.1",
+    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.2",
                             bg=BG_WINDOW, fg=ACCENT_SECOND, font=("Segoe UI Semibold", 9))
     footer_label.place(relx=1.0, rely=1.0, x=-12, y=-8, anchor="se")
 
@@ -461,8 +465,44 @@ def main():
     scrollbar = tk.Scrollbar(table_frame); scrollbar.pack(side="right", fill="y")
     columns = ("#", "title", "status")
     tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=6, yscrollcommand=scrollbar.set)
-    scrollbar.config(command=tree.yview)
+    # ========== ПКМ МЕНЮ ДЛЯ ПОВТОРА ==========
+        # ========== ПКМ МЕНЮ ДЛЯ ПОВТОРА / ПЕРЕЗАПУСКА ==========
+    context_menu = tk.Menu(root, tearoff=0)
 
+    def retry_selected():
+        """Перезапустить выделенный элемент с самого начала, в любом состоянии."""
+        try:
+            item = tree.selection()[0]
+        except Exception:
+            return
+
+        # Берём исходный текст/URL
+        url = manager.url_by_item.get(item) or tree.set(item, "title")
+
+        # Сбрасываем статус и запускаем заново
+        tree.set(item, "status", "🟡 Подготовка...")
+        out_dir = out_dir_var.get().strip()
+        manager.start_item(item, url, out_dir)
+
+    context_menu.add_command(label="Повторить / перезапустить загрузку",
+                             command=retry_selected)
+
+    def on_right_click(event):
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        tree.selection_set(item)
+        # Раньше меню показывалось только при ошибке,
+        # теперь — всегда, чтобы можно было перезапустить в любой момент.
+        context_menu.tk_popup(event.x_root, event.y_root)
+
+    tree.bind("<Button-3>", on_right_click)
+    # ========================================================
+
+    # ==========================================
+
+    scrollbar.config(command=tree.yview)
+    tree.bind("<Button-3>", on_right_click)
     tree.heading("#", text="№", anchor="center")
     tree.heading("title", text="Название / URL", anchor="w")
     tree.heading("status", text="Статус", anchor="center")
@@ -501,13 +541,39 @@ def main():
 
 
     counter_bar = tk.Frame(queue_part, bg=BG_SURFACE); counter_bar.pack(fill="x", pady=(2, 0))
-    active_counter = tk.Label(counter_bar, text="Активно: 0 / 3", bg=BG_SURFACE, fg=SUBTEXT, font=("Segoe UI", 10))
+    active_counter = tk.Label(counter_bar, text="Активно: 0 / 2", bg=BG_SURFACE, fg=SUBTEXT, font=("Segoe UI", 10))
     active_counter.pack(side="right", padx=6)
 
     # ========== DownloadManager ==========
-    manager = DownloadManager(root, tree, active_counter, max_parallel=3)
-    manager.ui_set_title = lambda item_id, title: root.after(0, update_row_title, tree, item_id, title)
+    pool = DriverPool(max_drivers=2, status_cb=lambda m: kino_status.config(text=m[-80:], fg=ACCENT_SECOND))
+    manager = DownloadManager(root, tree, active_counter, max_parallel=2, pool=pool)
+    def login_to_kino():
+        try:
+            kino_status.config(text="⏳ Инициализация входа.", fg=ACCENT_SECOND)
 
+            ok = real_login_to_kino(
+                lambda msg: kino_status.config(text=msg[-80:], fg=ACCENT_SECOND)
+            )
+
+            if ok:
+                kino_status.config(text="✅ Вход успешно выполнен", fg=ACCENT_SECOND)
+                kino_input.config(state="normal")
+                choose_btn.config(state="normal")
+                path_entry.config(state="normal")
+                btn_download.config(state="normal")
+            else:
+                kino_status.config(text="❌ Не удалось войти", fg="red")
+                messagebox.showerror("Ошибка", "❌ Не удалось войти в Kino.pub")
+
+        except Exception as e:
+            kino_status.config(text=f"Ошибка: {e}", fg="red")
+            messagebox.showerror("Ошибка", f"Ошибка при авторизации: {e}")
+
+    # после создания manager
+    def _ui_set_title(item_id, text):
+        tree.set(item_id, "title", text)
+
+    manager.ui_set_title = _ui_set_title
 
     def reindex_rows():
         for i, item in enumerate(tree.get_children(), start=1):
@@ -529,26 +595,9 @@ def main():
                 add_row(q, status="🟡 Подготовка...")
         reindex_rows()
 
-    def remove_selected():
-        sel = tree.selection()
-        if not sel: return
-        for item in sel: tree.delete(item)
-        reindex_rows()
+    
 
-    from kino_pub_downloader import login_to_kino as real_login_to_kino
 
-    def login_to_kino():
-        try:
-            kino_status.config(text="⏳ Инициализация входа...", fg=ACCENT_SECOND)
-            ok = real_login_to_kino(lambda msg: kino_status.config(text=msg[-80:], fg=ACCENT_SECOND))
-            if ok:
-                kino_status.config(text="✅ Вход успешно выполнен", fg=ACCENT_SECOND)
-                kino_input.config(state="normal"); choose_btn.config(state="normal")
-                path_entry.config(state="normal"); btn_download.config(state="normal")
-            else:
-                kino_status.config(text="❌ Не удалось войти", fg="red")
-        except Exception as e:
-            kino_status.config(text=f"Ошибка: {e}", fg="red")
 
     def start_kino_download():
         q = kino_input.get().strip()
@@ -565,7 +614,8 @@ def main():
 
     def stop_queue():
         manager.stop_all()
-
+    def remove_selected():
+        pass
     if SHOW_QUEUE_CONTROLS:
         btn_import.config(command=import_list)
         btn_delete.config(command=remove_selected)

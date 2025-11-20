@@ -257,9 +257,12 @@ def _robocopy_single(src_path: str, dst_path: str) -> tuple[int, str]:
         cmd,
         capture_output=True,
         text=True,
+        encoding="cp866",     # ← ключевое: вывод консоли Windows
+        errors="replace",     # ← не падать на редких байтах
         shell=False,
-        creationflags=CREATE_NO_WINDOW  # 🔸 окно cmd не открывается
+        creationflags=CREATE_NO_WINDOW
     )
+
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output
 
@@ -274,9 +277,12 @@ def _cmd_copy_single(src_path: str, dst_path: str) -> tuple[int, str]:
         cmd,
         capture_output=True,
         text=True,
+        encoding="cp866",     # ← важное
+        errors="replace",
         shell=False,
-        creationflags=CREATE_NO_WINDOW  # 🔸 скрыть окно cmd.exe
+        creationflags=CREATE_NO_WINDOW
     )
+
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output
 

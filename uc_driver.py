@@ -10,8 +10,12 @@ import win32process           # ← нужен для GetWindowThreadProcessId �
 import win32gui
 import win32con
 import undetected_chromedriver as uc
-import sys
-import logging
+# top-level explicit imports (без динамики внутри функций)
+from kino_parser import load_cookies_cdp as load_cookies
+from kino_parser import save_cookies_cdp as save_cookies
+
+__all__ = ["check_login", "check_login_on", "login_to_kino", "DriverPool", "download_multiple"]
+
 # psutil нужен, чтобы найти реальные PID-ы Chromium (а не chromedriver)
 try:
     import psutil
@@ -22,15 +26,10 @@ except Exception:
 
 # ===================== LOG =====================
 def _log(status_cb, msg: str):
-    msg = str(msg)
-    # в консоль (dev-режим) / никуда (exe без консоли)
-    print(msg, flush=True)
-    # в лог-файл logs/app.log
     try:
-        logging.info(msg)
+        print(msg, flush=True)
     except Exception:
         pass
-    # в UI-коллбек, если есть
     if status_cb:
         try:
             status_cb(msg)
@@ -40,73 +39,40 @@ def _log(status_cb, msg: str):
 
 
 # ============= Chromium discovery =============
-def _app_root() -> Path:
-    """
-    Базовая папка приложения.
-
-    - при обычном запуске .py: папка, где лежит этот файл
-    - при PyInstaller-onefile: временная папка sys._MEIPASS
-    - при PyInstaller-onedir: папка, где лежит exe
-    """
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            # onefile: всё распакуётся сюда
-            return Path(meipass)
-        # onedir: просто папка exe
-        return Path(sys.executable).resolve().parent
-
-    # dev-запуск: рядом с исходниками
-    return Path(__file__).resolve().parent
-
-
 def _find_chromium_exe() -> str | None:
-    """Ищем chrome.exe/Chromium рядом с приложением или в стандартных путях."""
+    """Ищем chrome.exe/Chromium. Поддерживаем .\\browser\\bin и переменную CHROMIUM_PATH."""
     env = os.environ.get("CHROMIUM_PATH")
-    base = _app_root()
+    here = Path(__file__).resolve().parent
 
-    def norm_path(p: Path) -> Path | None:
+    def n(p: Path) -> Path | None:
         try:
-            # Если это директория — ищем chrome.exe/chrome внутри
             if p.is_dir():
                 for name in ("chrome.exe", "chrome"):
-                    c = p / name
-                    if c.is_file():
-                        return c
-            # Если уже файл — просто проверяем, существует ли
+                    if (p / name).is_file():
+                        return p / name
             if p.is_file():
                 return p
-        except Exception:
+        except:
             pass
         return None
 
     guesses = []
-
-    # 1) Явно заданный путь через переменную среды
     if env:
         guesses.append(Path(env))
-
-    # 2) Рядом с приложением (и в dev, и в exe)
     guesses += [
-        base / "browser" / "bin",         # dist\browser\bin\chrome.exe
-        base / "browser",                 # dist\browser\chrome.exe
-        base / "browser" / "chromium",    # dist\browser\chromium\chrome.exe
+        here / "browser" / "bin" / "chrome.exe",
+        here / "browser" / "bin" / "chrome",
+        here / "browser" / "chrome.exe",
+        here / "browser" / "chromium" / "chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Chromium" / "Application" / "chrome.exe",
+        Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "Chromium" / "Application" / "chrome.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")) / "Chromium" / "Application" / "chrome.exe",
     ]
-
-    # 3) Установленный Chromium/Chrome в системе
-    guesses += [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Chromium" / "Application",
-        Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "Chromium" / "Application",
-        Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")) / "Chromium" / "Application",
-    ]
-
     for g in guesses:
-        found = norm_path(g)
-        if found:
-            return str(found)
-
+        p = n(g)
+        if p:
+            return str(p)
     return None
-
 
 
 def _parse_major_from_text(text: str) -> int | None:
@@ -235,14 +201,17 @@ def _safe_get_driver(status_cb=None, headless: bool = False, suppress: bool = Tr
                      profile_name: str | None = None):
 
     base_dir = Path(os.environ["LOCALAPPDATA"]) / "MediaSearch"
+
     if profile_tag == "login":
+        # Постоянный профиль — логин, сохраняет куки
         profile_dir = base_dir / "UC_PROFILE_LOGIN"
     else:
-        # уникальный профиль для каждого драйвера
+        # Временные уникальные профили — для многопоточной загрузки
         if not profile_name:
             profile_name = f"UC_PROFILE_RUN_{int(time.time()*1000)%100000}_{threading.get_ident()%1000}"
         profile_dir = base_dir / profile_name
-    profile_dir.mkdir(parents=True, exist_ok=True)
+
+
 
 
     if not _CHROMIUM_EXE:
@@ -282,7 +251,7 @@ def _safe_get_driver(status_cb=None, headless: bool = False, suppress: bool = Tr
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_argument("--hide-crash-restore-bubble")
             options.add_argument("--window-size=1280,900")
-            options.add_argument("--remote-debugging-port=0")
+            
             options.add_argument("--noerrdialogs")
             options.add_argument("--disable-crash-reporter")
 
@@ -323,13 +292,21 @@ def _safe_get_driver(status_cb=None, headless: bool = False, suppress: bool = Tr
             driver.set_page_load_timeout(20)
 
             # ← ДО любых переходов!
+            # внутри _safe_get_driver, в блоке:
             if preload_kino_cookies and profile_tag != "login":
                 try:
                     driver.execute_cdp_cmd("Network.enable", {})
-                    from kino_parser import load_cookies
-                    load_cookies(driver)
                 except Exception:
-                    pass
+                    _log(status_cb, "ℹ Network.enable failed (не критично)")
+
+                try:
+                    cnt = load_cookies(driver)  # <- возвращает количество применённых кук
+                    _log(status_cb, f"🍪 Профиль  успешно загружен: {cnt}")
+                except Exception as e:
+                    _log(status_cb, f"⚠ load_cookies exception: {e}")
+
+
+
 
 
             last_error = None
@@ -709,6 +686,7 @@ def _check_login_on(driver, status_cb=None):
         driver.get(KINOPUB_BASE + "/")
         WebDriverWait(driver, 6).until(lambda d: d.execute_script("return document.readyState") == "complete")
         driver.get(KINOPUB_BASE + "/user/profile")
+        print(f"[🔍] Текущий URL: {driver.current_url}")
         WebDriverWait(driver, 6).until(lambda d: d.execute_script("return document.readyState") == "complete")
         if "/user/login" in driver.current_url.lower():
             return False
@@ -720,70 +698,95 @@ def _check_login_on(driver, status_cb=None):
 
 
 def _check_login(status_cb=None) -> bool:
-    from kino_parser import load_cookies
-    driver = _safe_get_driver(status_cb, suppress=True)
-    try:
-        from kino_parser import load_cookies
+    # ВАЖНО: подгружаем куки ДО первого перехода
+    driver = _safe_get_driver(status_cb, suppress=True, preload_kino_cookies=True, profile_tag="login")
 
+    try:
         try:
-            # Разрешаем CDP и подгружаем куки ДО переходов
             driver.execute_cdp_cmd("Network.enable", {})
-            load_cookies(driver)                      # ← CDP setCookies, работает для httpOnly/SameSite
-        except:
+        except Exception:
             pass
 
         driver.get(KINOPUB_BASE + "/user/profile")
-        WebDriverWait(driver, 6).until(lambda d: d.execute_script("return document.readyState") == "complete")
-
+        print(f"[🔍] Текущий URL: {driver.current_url}")
         WebDriverWait(driver, 6).until(lambda d: d.execute_script("return document.readyState") == "complete")
         return "/user/login" not in driver.current_url.lower()
-    except:
+    except Exception as e:
+        _log(status_cb, f"⚠ _check_login error: {e}")
         return False
     finally:
         driver.quit()
 
 
+def check_login_on(driver, status_cb=None):
+    return _check_login_on(driver, status_cb)
+
+def check_login(status_cb=None) -> bool:
+    return _check_login(status_cb)
+
 # ======================= LOGIN WINDOW =======================
 def login_to_kino(status_cb=None):
-    from kino_parser import save_cookies
     import tkinter as tk
     from tkinter import messagebox
+    from kino_parser import has_valid_session, save_cookies
 
-    driver = _safe_get_driver(status_cb, suppress=False, profile_tag="login")
+    # 1) Если сессия по cookies уже живая — ничего не открываем
+    try:
+        if has_valid_session():
+            _log(status_cb, "✅ Сессия kino.pub уже активна, вход не требуется.")
+            return True
+    except Exception:
+        # если что-то пошло не так при проверке — просто идём по старому пути
+        pass
+
+    # 2) Открываем видимый Chromium c постоянным профилем "login"
+    driver = _safe_get_driver(
+        status_cb,
+        suppress=False,
+        profile_tag="login",      # <-- постоянный профиль
+        preload_kino_cookies=True # попытаться поднять cookies перед заходом
+    )
 
     try:
-        driver.get(KINOPUB_BASE + "/user/login")    
+        driver.get(KINOPUB_BASE + "/user/login")
         _log(status_cb, "🔓 Открыта страница входа...")
-        logged = False
-        hint_shown = False
-        for i in range(90):
-            try:
-                if driver.find_elements(By.CSS_SELECTOR, ".user-menu, .user-avatar, a[href*='/logout']"):
-                    logged = True
-                    break
-            except:
-                pass
-            if i == 10 and not hint_shown:
-                root = tk.Tk(); root.withdraw()
-                messagebox.showinfo("Авторизация", "Войдите вручную, затем закройте окно.")
-                root.destroy(); hint_shown = True
-            time.sleep(1)
-        if not logged:
-            _log(status_cb, "❌ Авторизация не выполнена.")
-            driver.quit(); return False
-        try:
-            save_cookies(driver)
-        except:
-            pass
-        driver.quit(); return True
-    except Exception as e:
-        _log(status_cb, f"❌ Ошибка login_to_kino: {e}")
-        try: driver.quit()
-        except: pass
+
+        # Ждём успешного логина / CF
+        t0 = time.time()
+        # Ждём успешного логина / CF
+        t0 = time.time()
+        while time.time() - t0 < 300:
+            url = driver.current_url.lower()
+            print(f"[🔍] Текущий URL: {url}")
+
+            # 👉 если страница логина — дать 45 секунд на ручной ввод
+            if "/user/login" in url:
+                _log(status_cb, "⏳ Ожидание 45 секунд — введите логин/пароль...")
+                time.sleep(45)
+                continue
+
+            # 👉 если вошли и редирект прошёл
+            if _check_login_on(driver, status_cb):
+                save_cookies(driver)
+                _log(status_cb, "💾 Cookies обновлены после CF/авторизации.")
+                messagebox.showinfo("Kino.pub", "Вход успешно выполнен!")
+                return True
+
+            time.sleep(2)
+
+
+        messagebox.showwarning("Kino.pub", "Не удалось подтвердить вход (таймаут).")
         return False
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
 # ========================= DRIVER POOL =========================
 class DriverPool:
-    def __init__(self, max_drivers=3, status_cb=None):
+    def __init__(self, max_drivers=2, status_cb=None):
         import queue
         self.max_drivers = max_drivers
         self.status_cb = status_cb
@@ -845,21 +848,29 @@ def download_multiple(urls, out_dir, status_cb=None):
     os.makedirs(out_dir, exist_ok=True)
     pool = DriverPool(max_drivers=2, status_cb=status_cb)
     threads = []
-    try:
-        for url in urls:
-            drv = pool.acquire(timeout=10)
-            try:
-                video_m3u8, hdrs, audios = get_hls_info(url, driver=drv)
-                if not video_m3u8:
-                    _log(status_cb, f"⚠ Пропущено: {url}")
-                    continue
-                name = os.path.basename(url).split("?")[0]
-                out_path = os.path.join(out_dir, f"{name}.mp4")
-                t = start_hls_download(video_m3u8, audios, hdrs, out_path, status_cb)
-                threads.append(t)
-            finally:
-                pool.release(drv)
-        for t in threads:
-            t.join()
-    finally:
-        pool.close_all()
+    
+    for url in urls:
+        drv = pool.acquire(timeout=10)
+        try:
+            video_m3u8, hdrs, audios = get_hls_info(url, driver=drv)
+            if not video_m3u8:
+                _log(status_cb, f"⚠ Пропущено: {url}")
+                continue
+
+            name = os.path.basename(url).split("?")[0]
+            out_path = os.path.join(out_dir, f"{name}.mp4")
+
+            t = threading.Thread(
+                target=start_hls_download,
+                args=(video_m3u8, audios, hdrs, out_path, status_cb),
+                daemon=True
+            )
+            t.start()
+            threads.append(t)
+        finally:
+            pool.release(drv)
+
+    # 🧷 Блокируем завершение до конца всех потоков
+    for t in threads:
+        t.join()
+

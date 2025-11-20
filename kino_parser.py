@@ -205,6 +205,25 @@ def find_portable_browser() -> tuple[str | None, int | None]:
             print(f"[DEBUG] check {p} → major={ver}")
             return p, ver
     return None, None
+def log_and_save_cookies(driver, status_cb=None):
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+    except:
+        pass
+
+    try:
+        save_cookies(driver)
+        msg = f"💾 Cookies (CDP) сохранены → {COOKIE_FILE}"
+        if status_cb:
+            status_cb(msg)
+        else:
+            print(msg)
+    except Exception as e:
+        msg = f"⚠️ Ошибка сохранения cookies: {e}"
+        if status_cb:
+            status_cb(msg)
+        else:
+            print(msg)
 
 # --- CDP cookies helpers (полный набор, включая HttpOnly) ---
 def save_cookies_cdp(driver) -> None:
@@ -219,6 +238,7 @@ def load_cookies_cdp(driver) -> bool:
     path = COOKIE_FILE if os.path.exists(COOKIE_FILE) else COOKIE_FILE_LEGACY
     if not os.path.exists(path):
         print(f"[COOKIES] Файл {path} не найден.")
+        print(f"[🍪] Загрузка куки в CDP: {len(cookies)} шт.")
         return False
 
     with open(path, "r", encoding="utf-8") as f:

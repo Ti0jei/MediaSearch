@@ -5,7 +5,7 @@ import re
 import logging
 import threading
 from tkinter import messagebox
-
+import queue
 # ❗ Правильные импорты
 from uc_driver import _safe_get_driver
 from kino_pub_downloader import download
@@ -13,7 +13,7 @@ from kino_pub_downloader import download
 
 # =============== Download Manager (3 параллельные загрузки) ===============
 class DownloadManager:
-    def __init__(self, root, tree, counter_label, max_parallel=3, pool=None):
+    def __init__(self, root, tree, counter_label, max_parallel=2, pool=None):
         self.root = root
         self.tree = tree
         self.url_by_item = {}  # item_id -> original URL
@@ -25,8 +25,28 @@ class DownloadManager:
         self.active = 0
         self.stop_flag = False
         self.threads = {}  # item_id -> Thread
-
+        # 🔥 Новая очередь задач + диспетчер
+        self.task_queue = queue.Queue()
+        threading.Thread(target=self._dispatcher, daemon=True).start()
     # --- UI-safe обновления ---
+    def _dispatcher(self):
+        """Постоянно ждёт задач и запускает worker ТОЛЬКО когда есть место."""
+        while True:
+            item_id, url, out_dir = self.task_queue.get()   # ждём задачу
+
+            # ЖДЁМ СВОБОДНЫЙ СЛОТ ❗
+            self.sema.acquire()
+
+            # Теперь запускаем worker
+            t = threading.Thread(
+                target=self._worker,
+                args=(item_id, url, out_dir),
+                daemon=True
+            )
+            self.threads[item_id] = t
+            t.start()
+
+
     def _ui(self, func, *args, **kwargs):
         self.root.after(0, lambda: func(*args, **kwargs))
 
@@ -50,37 +70,34 @@ class DownloadManager:
     def stop_all(self):
         self.stop_flag = True
         messagebox.showinfo("Остановлено", "Новые загрузки не будут запускаться.\nТекущие завершатся.")
-
+    
     # --- Обёртка вокруг фактической загрузки ---
     def _worker(self, item_id, url, out_dir):
         import traceback
+        sys.stdout.flush()
+        os.environ["PYTHONUNBUFFERED"] = "1"
+
+        if not self.can_start(item_id):
+            return
+
+        self.set_status(item_id, "🟡 Подготовка...")
+        time.sleep(0.25)
+
+        if not self.can_start(item_id):
+            return
+
+        # ❗❗❗ УБИРАЕМ self.sema.acquire() — диспетчер уже сделал это!
+        self.inc_active()
+        self.set_status(item_id, "🔵 Загрузка...")
+
 
         drv = None
-        used_pool = False
-
         try:
-            if not self.can_start(item_id):
-                return
-
-            # начальный статус (дублирует add_row, но ну и ладно)
-            self.set_status(item_id, "🟡 Подготовка...")
-            time.sleep(0.25)
-
-            if not self.can_start(item_id):
-                return
-
-            # ждём свободный слот
-            self.set_status(item_id, "⏳ Ожидание очереди…")
-            self.sema.acquire()
-            self.inc_active()
-            self.set_status(item_id, "🔧 Инициализация Chromium…")
-
-            # --- получаем драйвер ---
+            # ❗ Теперь UC берём из uc_driver.py
+            # 🔥 Берём драйвер из пула, а НЕ создаём новый UC каждый раз!
             if self.pool:
-                drv = self.pool.acquire(timeout=30)
-                used_pool = True
+                drv = self.pool.acquire()
             else:
-                # на всякий случай — если будем отлаживать exe с видимым окном
                 drv = _safe_get_driver(
                     status_cb=lambda m: print(m),
                     headless=False,
@@ -88,72 +105,104 @@ class DownloadManager:
                     need_login_hint=False
                 )
 
-            # драйвер готов — переходим к загрузке
-            self.set_status(item_id, "🔵 Загрузка...")
+            from kino_parser import load_cookies
+
+            # прогрев не нужен — downloader сам загрузит cookies и проверит сессию
+            pass
+
 
             def _status_proxy(msg):
-                # обновляем статус
-                self.set_status(item_id, str(msg))
-                # вытаскиваем имя файла и подменяем title
+                text = str(msg)
+
+                # ---- Заголовок файла ----
                 try:
-                    m = re.search(r'(?:🎬\s*)?(?:Файл|Название)\s*:\s*(.+)', str(msg))
+                    m = re.search(r'(?:🎬\s*)?(?:Файл|Название)\s*:\s*(.+)', text)
                     if m and hasattr(self, "ui_set_title"):
                         raw = m.group(1).strip().strip('"\'')
                         nice = os.path.splitext(os.path.basename(raw))[0]
                         self.ui_set_title(item_id, nice)
-                except Exception:
+                except:
                     pass
+
+                 # ---- Фильтр UI статусов ----
+                # старт видео
+                if "⬇️ Видео" in text or "Скачиваю видео" in text:
+                    self.set_status(item_id, "🔵 Видео…")
+
+                # старт аудио
+                elif text.startswith("⬇️ Аудио") or "Скачиваю аудио" in text:
+                    self.set_status(item_id, "🔵 Аудио…")
+
+                # MUX идёт — счётчик НЕ трогаем
+                elif "Муксую" in text or "MUX…" in text:
+                    self.set_status(item_id, "🟣 MUX…")
+
+                # Ошибка MUX — считаем как финал работы, уменьшаем active
+                elif "Ошибка MUX" in text:
+                    self.set_status(item_id, "❌ Ошибка MUX")
+                    self.dec_active()
+
+                # Успех — любое "✅ ..."
+                elif text.startswith("✅ "):
+                    self.set_status(item_id, "✅ Готово")
+                    self.dec_active()
+
+                # Остальное — только в лог
+                else:
+                    print(text)
+
+
+                
+
+
+
 
             ok = download(
                 url,
                 out_dir,
                 status_cb=_status_proxy,
-                driver=drv,
+                driver=drv
             )
 
-            self.set_status(item_id, "✅ Готово" if ok else "❌ Ошибка")
+            # Здесь НЕ ставим "Готово" — финальный статус приходит из HLS по msg "✅ ...".
+            if not ok:
+                cur = self.tree.set(item_id, "status")
+                if not str(cur).startswith("❌"):
+                    self.set_status(item_id, "❌ Ошибка загрузки")
+                self.dec_active()
+
+
+        
 
         except Exception as e:
-            err = f"Ошибка скачивания: {e}"
-            logging.error(err)
-            logging.error(traceback.format_exc())
-            # чтобы в UI было видно, что что-то сломалось
+            err_text = f"Ошибка скачивания: {e}\n{traceback.format_exc()}"
+            logging.error(err_text)
             self.set_status(item_id, f"❌ {e}")
+            print(err_text, flush=True)
 
         finally:
-            # аккуратно отпускаем ресурсы
             try:
-                if drv:
-                    if used_pool and self.pool:
-                        try:
-                            self.pool.release(drv)
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            drv.quit()
-                        except Exception:
-                            pass
-            finally:
-                # всегда уменьшаем счётчик и отпускаем семафор
-                try:
-                    self.dec_active()
-                except Exception:
-                    pass
-                try:
-                    self.sema.release()
-                except Exception:
-                    pass
+                if self.pool:
+                    self.pool.release(drv)
+                else:
+                    drv.quit()
+            except:
+                pass
+
+
+            self.sema.release()
 
 
     # --- Публичные методы запуска ---
     def start_item(self, item_id, url, out_dir):
         if not self.can_start(item_id):
             return
-        self.url_by_item[item_id] = url  # <-- добавили
-        t = threading.Thread(target=self._worker, args=(item_id, url, out_dir), daemon=True)
-        self.threads[item_id] = t
-        t.start()
+        self.url_by_item[item_id] = url
+
+        # ❗ Вместо запуска worker — кладём задачу в очередь
+        self.task_queue.put((item_id, url, out_dir))
+        self.set_status(item_id, "🟡 Ожидает...")
+
 
 
     def start_all(self, out_dir):

@@ -150,22 +150,9 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None) -> boo
 
             use_driver = driver
 
-        # ======= ЕСЛИ ДРАЙВЕР НЕ ПЕРЕДАН =======
         else:
-            if not _check_login(status_cb):
-                _log(status_cb, "⚠️ Сессия неактивна. Выполните вход.")
-                return False
+            raise RuntimeError("Download() must be called with driver — internal UC driver forbidden.")
 
-            internal_driver = _safe_get_driver(status_cb, headless=True, suppress=True)
-            use_driver = internal_driver
-
-            use_driver.get(KINOPUB_BASE + "/")
-            load_cookies(use_driver)
-            use_driver.refresh()
-
-            if not _check_login_on(use_driver, status_cb):
-                _log(status_cb, "⚠️ Cookies не помогли — требуется вход.")
-                return False
 
         # ======= ДАЛЬШЕ ИСПОЛЬЗУЕМ use_driver =======
 
@@ -181,14 +168,35 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None) -> boo
 
         _log(status_cb, "📋 Извлекаю название...")
         display_name = _extract_display_name(use_driver, item_url)
+
+        # --- НОРМАЛИЗАЦИЯ имени ---
+        # убираем готовое расширение, если вдруг есть
+        if display_name.lower().endswith(".mp4"):
+            display_name = display_name[:-4]
+
+        # формируем output
         out_path = os.path.join(out_dir, display_name + ".mp4")
+
         _log(status_cb, f"🎬 Файл: {os.path.basename(out_path)}")
 
-        _log(status_cb, f"🎬 Запуск загрузки через HLS...")
-        ok = download_by_item_url(item_url, out_path, driver=use_driver)
+        # --- здесь только запуск подготовки ---
+        _log(status_cb, "🎬 Подготовка… (анализ HLS)")
 
-        _log(status_cb, "✅ Готово!" if ok else "❌ Ошибка.")
-        return ok
+        ok = download_by_item_url(item_url, out_path, driver=use_driver, status_cb=status_cb)
+
+
+        # ВАЖНО:
+        # download_by_item_url() всегда завершает СРАЗУ,
+        # а само скачивание идёт в фоне через start_hls_download()
+        # Поэтому НЕ пишем “Готово!” здесь.
+
+        if not ok:
+            _log(status_cb, "❌ Ошибка при подготовке HLS.")
+        else:
+            _log(status_cb, "⏳ Подготовка завершена, началось скачивание...")
+        # ВАЖНО: НИЧЕГО НЕ ВОЗВРАЩАЕМ КАК ГОТОВО!
+        return True
+        
 
     except Exception as e:
         _log(status_cb, f"❌ Ошибка: {e}")
@@ -285,15 +293,16 @@ class QueueDownloader:
 
             drv = None
             try:
-                drv = self.pool.acquire(timeout=15)
+                drv = self.pool.acquire(timeout=15, profile_tag="run")
 
                 # быстрый прогрев cookies (один раз на драйвер)
                 try:
                     if not getattr(drv, "_kino_cookies_loaded", False):
-                        drv.get(KINOPUB_BASE + "/")
+                        drv.get("chrome://newtab")
                         load_cookies(drv)
-                        drv.refresh()
+                        drv.get(KINOPUB_BASE + "/")
                         setattr(drv, "_kino_cookies_loaded", True)
+
                 except Exception as e:
                     _log(self.status_cb, f"⚠️ Ошибка подгрузки cookies: {e}")
 
@@ -315,8 +324,16 @@ class QueueDownloader:
                 except Exception:
                     # не критично — fallback
                     display_name = os.path.basename(item_url).split("?")[0]
+
+                # --- НОРМАЛИЗАЦИЯ имени ---
+                # иногда _extract_display_name() возвращает уже 'Название (2025).mp4'
+                # из-за этого появляется '.mp4.mp4.part' → ffmpeg падает
+                if display_name.lower().endswith(".mp4"):
+                    display_name = display_name[:-4]
+
                 out_path = os.path.join(self.out_dir, display_name + ".mp4")
                 _log(self.status_cb, f"🎬 [{threading.current_thread().name}] → {os.path.basename(out_path)}")
+
 
                 # получаем m3u8/заголовки/аудио
                 video_m3u8, hdrs, audios = get_hls_info(item_url, driver=drv)

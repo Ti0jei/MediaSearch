@@ -154,74 +154,248 @@ def _run_installer_and_exit(installer_path):
         pass
 
 
-# ---- UI ----
+# ===================== КРАСИВЫЙ UI ОБНОВЛЕНИЯ =====================
+
+# Цвета в стиле Movie Tools
+BG_WINDOW = "#05051A"   # тёмный фон
+BG_PANEL = "#101427"    # карточка
+ACCENT = "#FF4FA3"      # розовый акцент
+ACCENT_2 = "#7C4DFF"    # сиреневый прогресс
+FG_TEXT = "#F5F5FF"
+FG_MUTED = "#9AA0C2"
+BORDER = "#272C45"
+
+
+class UpdateDialog(tk.Toplevel):
+    """Окно обновления в фирменном стиле."""
+
+    def __init__(self, parent, latest: dict, on_install, on_skip, on_later):
+        super().__init__(parent)
+        self.latest = latest
+        self.on_install_cb = on_install
+        self.on_skip_cb = on_skip
+        self.on_later_cb = on_later
+
+        self.title(f"Доступно обновление {latest['version']}")
+        self.configure(bg=BG_WINDOW)
+        self.resizable(False, False)
+        # Иконка окна (та же, что у основного EXE)
+        try:
+            if getattr(sys, "frozen", False):
+                base_dir = os.path.dirname(sys.executable)
+            else:
+                base_dir = os.path.dirname(__file__)
+            icon_path = os.path.join(base_dir, "icon.ico")
+            if os.path.exists(icon_path):
+                self.iconbitmap(icon_path)
+        except Exception:
+            # Если что-то пойдёт не так — просто остаётся дефолтная иконка
+            pass
+
+        # Центрировать относительно родителя
+        self.update_idletasks()
+        if parent is not None:
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            w, h = 520, 360
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        else:
+            self.geometry("520x360")
+
+        self.transient(parent)
+        self.grab_set()
+
+        # стили
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        style.configure("Update.TFrame", background=BG_WINDOW)
+        style.configure("Card.TFrame", background=BG_PANEL, bordercolor=BORDER,
+                        borderwidth=1, relief="solid")
+        style.configure("Title.TLabel", background=BG_WINDOW, foreground=FG_TEXT,
+                        font=("Segoe UI Semibold", 16))
+        style.configure("SubTitle.TLabel", background=BG_WINDOW, foreground=FG_MUTED,
+                        font=("Segoe UI", 10))
+        style.configure("CardTitle.TLabel", background=BG_PANEL, foreground=FG_TEXT,
+                        font=("Segoe UI Semibold", 11))
+        style.configure("CardText.TLabel", background=BG_PANEL, foreground=FG_MUTED,
+                        font=("Segoe UI", 9))
+        style.configure("Accent.TButton", font=("Segoe UI Semibold", 10),
+                        foreground=FG_TEXT, background=ACCENT,
+                        borderwidth=0, focusthickness=0, padding=(14, 6))
+        style.map("Accent.TButton", background=[("active", "#ff6ab1")])
+        style.configure("Ghost.TButton", font=("Segoe UI", 10),
+                        foreground=FG_MUTED, background=BG_PANEL,
+                        borderwidth=1, bordercolor=BORDER, padding=(12, 5))
+        style.map("Ghost.TButton", background=[("active", "#191f35")])
+        style.configure("Update.Horizontal.TProgressbar",
+                        troughcolor=BG_PANEL, bordercolor=BG_PANEL,
+                        background=ACCENT_2, thickness=6)
+
+        # корневой фрейм
+        root_frame = ttk.Frame(self, style="Update.TFrame", padding=16)
+        root_frame.pack(fill="both", expand=True)
+
+        # заголовок
+        header = ttk.Frame(root_frame, style="Update.TFrame")
+        header.pack(fill="x")
+
+        ttk.Label(
+            header,
+            text="Доступно обновление Movie Tools",
+            style="Title.TLabel",
+        ).pack(anchor="w")
+
+        ttk.Label(
+            header,
+            text=f"Найдена новая версия: {latest['version']}",
+            style="SubTitle.TLabel",
+        ).pack(anchor="w", pady=(4, 10))
+
+        # карточка с changelog
+        card = ttk.Frame(root_frame, style="Card.TFrame", padding=12)
+        card.pack(fill="both", expand=True)
+
+        ttk.Label(
+            card,
+            text="Описание изменений",
+            style="CardTitle.TLabel",
+        ).pack(anchor="w")
+
+        self.txt = tk.Text(
+            card,
+            bg=BG_PANEL,
+            fg=FG_TEXT,
+            insertbackground=FG_TEXT,
+            relief="flat",
+            height=7,
+            font=("Consolas", 9),
+            wrap="word",
+        )
+        self.txt.pack(fill="both", expand=True, pady=(4, 8))
+
+        notes = latest.get("notes") or "Нет описания изменений."
+        self.txt.insert("1.0", notes)
+        self.txt.configure(state="disabled")
+
+        # прогресс
+        bottom_card = ttk.Frame(card, style="Card.TFrame")
+        bottom_card.pack(fill="x")
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress = ttk.Progressbar(
+            bottom_card,
+            style="Update.Horizontal.TProgressbar",
+            maximum=100.0,
+            variable=self.progress_var,
+        )
+        self.progress.pack(fill="x", pady=(4, 2))
+
+        self.status_var = tk.StringVar(value="Ожидание начала загрузки…")
+        self.lbl_status = ttk.Label(
+            bottom_card,
+            textvariable=self.status_var,
+            style="CardText.TLabel",
+        )
+        self.lbl_status.pack(anchor="w")
+
+        # кнопки
+        buttons = ttk.Frame(root_frame, style="Update.TFrame")
+        buttons.pack(fill="x", pady=(10, 0))
+
+        self.btn_install = ttk.Button(
+            buttons,
+            text="Установить",
+            style="Accent.TButton",
+            command=self._on_install_clicked,
+        )
+        self.btn_install.pack(side="right")
+
+        self.btn_later = ttk.Button(
+            buttons,
+            text="Позже",
+            style="Ghost.TButton",
+            command=self._on_later_clicked,
+        )
+        self.btn_later.pack(side="right", padx=(0, 8))
+
+        self.btn_skip = ttk.Button(
+            buttons,
+            text="Пропустить версию",
+            style="Ghost.TButton",
+            command=self._on_skip_clicked,
+        )
+        self.btn_skip.pack(side="left")
+
+    # --- публичные методы для обновления из потока ---
+
+    def set_progress(self, percent: float):
+        self.progress_var.set(max(0.0, min(100.0, percent)))
+
+    def set_status(self, text: str):
+        self.status_var.set(text)
+
+    def set_buttons_enabled(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        for b in (self.btn_install, self.btn_skip, self.btn_later):
+            self._set_btn_state(b, state)
+
+    @staticmethod
+    def _set_btn_state(btn, state: str):
+        btn["state"] = state
+
+    # --- обработчики кнопок ---
+
+    def _on_install_clicked(self):
+        if callable(self.on_install_cb):
+            self.on_install_cb(self)
+
+    def _on_skip_clicked(self):
+        if callable(self.on_skip_cb):
+            self.on_skip_cb(self)
+
+    def _on_later_clicked(self):
+        if callable(self.on_later_cb):
+            self.on_later_cb(self)
+
+
+# ---- UI-обвязка вокруг UpdateDialog ----
 def _show_prompt(root, latest: dict):
-    win = tk.Toplevel(root)
-    win.title(f"Доступно обновление {latest['version']}")
-    win.transient(root)
-    win.grab_set()
-    win.resizable(False, False)
+    """Создаёт красивое окно и вешает на него логику скачивания/установки."""
 
-    frm = ttk.Frame(win, padding=12)
-    frm.grid(row=0, column=0, sticky="nsew")
-
-    ttk.Label(
-        frm, text=f"Найдена новая версия: {latest['version']}", font=("Segoe UI", 11, "bold")
-    ).grid(row=0, column=0, sticky="w")
-
-    notes = latest.get("notes") or "Нет описания изменений."
-    txt = tk.Text(frm, width=60, height=12, wrap="word")
-    scr = ttk.Scrollbar(frm, command=txt.yview)
-    txt.configure(yscrollcommand=scr.set)
-    txt.insert("1.0", notes)
-    txt.config(state="disabled")
-    txt.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
-    scr.grid(row=1, column=1, sticky="ns", pady=(8, 8))
-
-    prog_var = tk.IntVar(value=0)
-    prog = ttk.Progressbar(
-        frm, orient="horizontal", mode="determinate", length=360, maximum=100, variable=prog_var
-    )
-    lblp = ttk.Label(frm, text="")
-    btns = ttk.Frame(frm)
-    btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
-    btn_install = ttk.Button(btns, text="Установить", width=16)
-    btn_skip = ttk.Button(btns, text="Пропустить версию", width=20)
-    btn_later = ttk.Button(btns, text="Позже", width=12, command=win.destroy)
-    btn_install.grid(row=0, column=0, padx=4)
-    btn_skip.grid(row=0, column=1, padx=4)
-    btn_later.grid(row=0, column=2, padx=4)
-
-    def _disable_buttons():
-        for b in (btn_install, btn_skip, btn_later):
-            b.configure(state="disabled")
-
-    def _enable_buttons():
-        for b in (btn_install, btn_skip, btn_later):
-            b.configure(state="normal")
-
-    def on_skip():
+    def do_skip(dlg: UpdateDialog):
         prefs = _prefs_load()
         prefs["skip_version"] = latest["version"]
         _prefs_save(prefs)
-        win.destroy()
+        dlg.destroy()
 
-    btn_skip.configure(command=on_skip)
+    def do_later(dlg: UpdateDialog):
+        dlg.destroy()
 
-    def on_install():
-        _disable_buttons()
-        prog.grid(row=2, column=0, columnspan=2, sticky="ew")
-        lblp.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    def do_install(dlg: UpdateDialog):
+        dlg.set_buttons_enabled(False)
+        dlg.set_status("Подготовка к загрузке…")
+        dlg.set_progress(0.0)
 
         def worker():
             try:
                 tmp_dir = tempfile.gettempdir()
-                dest = os.path.join(tmp_dir, f"MediaSearchSetup_{latest['version']}.exe")
+                dest = os.path.join(
+                    tmp_dir, f"MediaSearchSetup_{latest['version']}.exe"
+                )
 
                 def _cb(done, total):
                     pct = max(0, min(100, int(done * 100 / total)))
                     root.after(
-                        0, lambda: (prog_var.set(pct), lblp.config(text=f"Загрузка: {pct}%"))
+                        0,
+                        lambda: (
+                            dlg.set_progress(pct),
+                            dlg.set_status(f"Загрузка: {pct}%"),
+                        ),
                     )
 
                 _download_with_progress(latest["url"], dest, on_progress=_cb)
@@ -234,24 +408,26 @@ def _show_prompt(root, latest: dict):
                             os.remove(dest)
                         except Exception:
                             pass
-                        raise RuntimeError("Хеш файла не совпал. Файл повреждён или подменён.")
+                        raise RuntimeError(
+                            "Хеш файла не совпал. Файл повреждён или подменён."
+                        )
 
+                # Успех: запускаем установщик и выходим
                 root.after(0, lambda: _run_installer_and_exit(dest))
             except Exception as e:
-                root.after(
-                    0,
-                    lambda: (
-                        _enable_buttons(),
-                        prog.grid_remove(),
-                        lblp.config(text=""),
-                        messagebox.showerror("Обновление", f"Ошибка загрузки/установки:\n{e}"),
-                    ),
-                )
-
+                def _on_err():
+                    dlg.set_buttons_enabled(True)
+                    dlg.set_progress(0.0)
+                    dlg.set_status("Ошибка загрузки.")
+                    messagebox.showerror(
+                        "Обновление",
+                        f"Ошибка загрузки/установки:\n{e}",
+                    )
+                root.after(0, _on_err)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    btn_install.configure(command=on_install)
+    UpdateDialog(root, latest, on_install=do_install, on_skip=do_skip, on_later=do_later)
 
 
 # ---- публичная функция ----
@@ -288,7 +464,10 @@ def check_for_updates_async(root, show_if_latest=False):
             if new <= cur:
                 if show_if_latest:
                     root.after(
-                        0, lambda: messagebox.showinfo("Обновление", "У вас последняя версия.")
+                        0,
+                        lambda: messagebox.showinfo(
+                            "Обновление", "У вас последняя версия."
+                        ),
                     )
                 return
             if _prefs_load().get("skip_version") == latest["version"]:

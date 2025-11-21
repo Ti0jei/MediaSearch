@@ -30,21 +30,26 @@ class DownloadManager:
         threading.Thread(target=self._dispatcher, daemon=True).start()
     # --- UI-safe обновления ---
     def _dispatcher(self):
-        """Постоянно ждёт задач и запускает worker ТОЛЬКО когда есть место."""
+        logging.info("Dispatcher thread started")
         while True:
-            item_id, url, out_dir = self.task_queue.get()   # ждём задачу
+            try:
+                item_id, url, out_dir = self.task_queue.get()
+                logging.info("Dispatcher got task: %s %s", item_id, url)
 
-            # ЖДЁМ СВОБОДНЫЙ СЛОТ ❗
-            self.sema.acquire()
+                self.sema.acquire()
 
-            # Теперь запускаем worker
-            t = threading.Thread(
-                target=self._worker,
-                args=(item_id, url, out_dir),
-                daemon=True
-            )
-            self.threads[item_id] = t
-            t.start()
+                t = threading.Thread(
+                    target=self._worker,
+                    args=(item_id, url, out_dir),
+                    daemon=True,
+                    name=f"DLWorker-{item_id}"
+                )
+                self.threads[item_id] = t
+                t.start()
+            except Exception:
+                logging.exception("Ошибка в dispatcher")
+
+
 
 
     def _ui(self, func, *args, **kwargs):
@@ -74,8 +79,10 @@ class DownloadManager:
     # --- Обёртка вокруг фактической загрузки ---
     def _worker(self, item_id, url, out_dir):
         import traceback
-        sys.stdout.flush()
-        os.environ["PYTHONUNBUFFERED"] = "1"
+
+        # ❌ Это в EXE без консоли может падать:
+        # sys.stdout.flush()
+        # os.environ["PYTHONUNBUFFERED"] = "1"
 
         if not self.can_start(item_id):
             return
@@ -86,9 +93,11 @@ class DownloadManager:
         if not self.can_start(item_id):
             return
 
-        # ❗❗❗ УБИРАЕМ self.sema.acquire() — диспетчер уже сделал это!
+        # здесь всё как было дальше
         self.inc_active()
         self.set_status(item_id, "🔵 Загрузка...")
+        ...
+
 
 
         drv = None

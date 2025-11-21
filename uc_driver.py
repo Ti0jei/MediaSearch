@@ -201,7 +201,7 @@ def _safe_get_driver(status_cb=None, headless: bool = False, suppress: bool = Tr
                      profile_name: str | None = None):
 
     base_dir = Path(os.environ["LOCALAPPDATA"]) / "MediaSearch"
-
+    base_dir.mkdir(parents=True, exist_ok=True)
     if profile_tag == "login":
         # Постоянный профиль — логин, сохраняет куки
         profile_dir = base_dir / "UC_PROFILE_LOGIN"
@@ -210,7 +210,7 @@ def _safe_get_driver(status_cb=None, headless: bool = False, suppress: bool = Tr
         if not profile_name:
             profile_name = f"UC_PROFILE_RUN_{int(time.time()*1000)%100000}_{threading.get_ident()%1000}"
         profile_dir = base_dir / profile_name
-
+    profile_dir.mkdir(parents=True, exist_ok=True)       
 
 
 
@@ -254,7 +254,7 @@ def _safe_get_driver(status_cb=None, headless: bool = False, suppress: bool = Tr
             
             options.add_argument("--noerrdialogs")
             options.add_argument("--disable-crash-reporter")
-
+            options.add_argument("--remote-debugging-port=0")
 
             if suppress:
                 # для download-режима — сворачиваем/уводим

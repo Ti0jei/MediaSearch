@@ -2,6 +2,9 @@ import os
 import time
 import logging
 import tkinter as tk
+import shutil
+import json
+import subprocess
 from auto_update import check_for_updates_async
 from download_manager import DownloadManager
 from uc_driver import DriverPool
@@ -12,6 +15,26 @@ from file_actions import load_index_from_efu
 from threaded_tasks import threaded_save_checked
 from kino_pub_downloader import login_to_kino as real_login_to_kino
 from urllib.parse import urljoin
+# --- Настройки (последняя папка сохранения и т.п.) ---
+SETTINGS_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "MediaSearch")
+os.makedirs(SETTINGS_DIR, exist_ok=True)
+SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error("Ошибка сохранения настроек: %s", e)
 
 
 SHOW_QUEUE_CONTROLS = False  # скрыть блок: Импорт списка / Удалить / Запустить всё / Остановить
@@ -320,7 +343,7 @@ def main():
 
     tk.Frame(main_menu, bg=BORDER, height=1).place(relx=0, rely=1.0, 
                                                    relwidth=1.0, y=-26, anchor="sw")
-    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.2",
+    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.3",
                             bg=BG_WINDOW, fg=ACCENT_SECOND, font=("Segoe UI Semibold", 9))
     footer_label.place(relx=1.0, rely=1.0, x=-12, y=-8, anchor="se")
 
@@ -331,12 +354,16 @@ def main():
              font=("Segoe UI Semibold", 16)).pack(side="left", padx=12, pady=8)
 
     right_controls = tk.Frame(commandbar, bg=BG_SURFACE); right_controls.pack(side="right", padx=12, pady=8)
-    btn_export = tk.Button(right_controls, text="Проверить NAS"); style_primary(btn_export); btn_export.pack(side="left", padx=(0, 10))
+    btn_export = tk.Button(right_controls, text="Проверить NAS")
+    style_secondary(btn_export)
+    btn_export.pack(side="left", padx=(0, 10))
     tk.Label(right_controls, text="Год:", bg=BG_SURFACE, fg=SUBTEXT, font=("Segoe UI", 11)).pack(side="left")
     year_entry = tk.Entry(right_controls, font=("Segoe UI", 11), width=8, state="disabled",
                           bg="#0D1138", fg="white", insertbackground="white", relief="flat")
     year_entry.pack(side="left", padx=(6, 8))
-    btn_find_year = tk.Button(right_controls, text="Найти", state="disabled"); style_primary(btn_find_year); btn_find_year.pack(side="left")
+    btn_find_year = tk.Button(right_controls, text="Найти", state="disabled")
+    style_secondary(btn_find_year)
+    btn_find_year.pack(side="left")
 
     btn_back_mm = tk.Button(commandbar, text="← В меню"); style_secondary(btn_back_mm)
     btn_back_mm.config(command=lambda: slide_switch(finder, main_menu, root, "left"))
@@ -369,7 +396,8 @@ def main():
     btn_toggle.pack(side="left", padx=6)
 
 
-    btn_copy = tk.Button(actions, text="Скопировать отмеченные"); style_primary(btn_copy)
+    btn_copy = tk.Button(actions, text="Скопировать отмеченные")
+    style_secondary(btn_copy)
     btn_copy.pack(side="left", padx=6)
 
     def update_copy_button_text():
@@ -410,15 +438,69 @@ def main():
     else:
         root.bind("<Escape>", lambda e: root.iconify())
 
+        # сброс профиля MediaSearch + UC-драйвера для Kino.pub
+    def reset_kino_profile():
+        local = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
+        media_profile = os.path.join(local, "MediaSearch")
+
+        roaming = os.getenv("APPDATA") or os.path.expanduser("~")
+        uc_profile = os.path.join(roaming, "undetected_chromedriver")
+
+        msg = (
+            "Будут удалены папки профиля:\n\n"
+            f"{media_profile}\n"
+            f"{uc_profile}\n\n"
+            "Это сбросит кеш/профиль браузера и UC-драйвера.\n"
+            "Продолжить?"
+        )
+        if not messagebox.askyesno("Обновить профиль", msg):
+            return
+
+        for path in (media_profile, uc_profile):
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                    logging.info("Удалена папка профиля: %s", path)
+            except Exception as e:
+                logging.error("Ошибка удаления профиля %s: %s", path, e)
+
+        messagebox.showinfo(
+            "Обновить профиль",
+            "Папки профиля удалены.\n\n"
+            "Рекомендуется перезапустить программу перед\n"
+            "повторной работой с Kino.pub."
+        )
 
     # ========== Kino.pub Tools ==========
     kino_top = tk.Frame(kino, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
     kino_top.pack(side="top", fill="x")
-    tk.Label(kino_top, text="Kino.pub Tools", bg=BG_SURFACE, fg=ACCENT_SECOND,
-             font=("Segoe UI Semibold", 16)).pack(side="left", padx=12, pady=10)
-    btn_back_kino = tk.Button(kino_top, text="← В меню"); style_secondary(btn_back_kino)
+
+    tk.Label(
+        kino_top,
+        text="Kino.pub Tools",
+        bg=BG_SURFACE,
+        fg=ACCENT_SECOND,
+        font=("Segoe UI Semibold", 16),
+    ).pack(side="left", padx=12, pady=10)
+
+    # кнопка "В меню"
+    btn_back_kino = tk.Button(kino_top, text="← В меню")
+    style_secondary(btn_back_kino)
     btn_back_kino.config(command=lambda: slide_switch(kino, main_menu, root, "left"))
     btn_back_kino.pack(side="left", padx=10)
+
+    # кнопка "Обновить профиль"
+    btn_reset_profile = tk.Button(kino_top, text="Обновить профиль")
+    style_secondary(btn_reset_profile)
+    btn_reset_profile.config(command=reset_kino_profile)
+    btn_reset_profile.pack(side="left", padx=6)
+
+    # кнопка "Войти в Kino.pub" — справа вверху
+    btn_login_uc = tk.Button(kino_top, text="Войти в Kino.pub")
+    style_secondary(btn_login_uc)
+    btn_login_uc.pack(side="right", padx=12)
+
+
 
     card_kino = tk.Frame(kino, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
     card_kino.place(relx=0.5, rely=0.555, anchor="center", width=680, height=640)
@@ -427,27 +509,51 @@ def main():
     top_part = tk.Frame(card_kino, bg=BG_SURFACE); top_part.pack(fill="x", pady=(20, 10))
     tk.Label(top_part, text="🎬 Kino.pub Downloader", bg=BG_SURFACE, fg=ACCENT,
              font=("Segoe UI Semibold", 20)).pack(pady=(0, 10))
-    tk.Label(top_part, text="Введите запрос или URL карточки — будет скачано видео (m3u8/mp4)",
+    tk.Label(top_part, text="Введите запрос или URL карточки — будет скачано видео",
              bg=BG_SURFACE, fg=SUBTEXT, font=("Segoe UI", 10), wraplength=520, justify="center").pack(pady=(0, 14))
 
     input_frame = tk.Frame(top_part, bg=BG_SURFACE); input_frame.pack(fill="x", padx=40)
-    tk.Label(input_frame, text="🔍 Запрос или URL:", bg=BG_SURFACE, fg=SUBTEXT,
+    tk.Label(input_frame, text="🔍URL с kino.pub:", bg=BG_SURFACE, fg=SUBTEXT,
              font=("Segoe UI", 10)).pack(anchor="w")
-    kino_input = tk.Entry(input_frame, bg="#0D1138", fg="white", insertbackground="white",
-                          relief="flat", font=("Segoe UI", 11), state="disabled")
-    kino_input.pack(fill="x", ipady=6, pady=(4, 0))
+    # строка: поле ввода + кнопка "Скачать" справа
+    input_row = tk.Frame(input_frame, bg=BG_SURFACE)
+    input_row.pack(fill="x", pady=(4, 0))
+
+    kino_input = tk.Entry(
+        input_row,
+        bg="#0D1138",
+        fg="white",
+        insertbackground="white",
+        relief="flat",
+        font=("Segoe UI", 11),
+        state="disabled",
+    )
+    kino_input.pack(side="left", fill="x", expand=True, ipady=4)
+
+    # кнопка "Скачать" такого же размера/стиля, как "Выбрать"
+    btn_download = tk.Button(input_row, text="⬇️ Скачать", state="disabled")
+    style_secondary(btn_download)          # тот же стиль, что и у "Выбрать"
+    btn_download.pack(side="left", padx=(8, 0), ipady=2)
+
 
     path_frame = tk.Frame(top_part, bg=BG_SURFACE); path_frame.pack(fill="x", padx=40, pady=(10, 8))
     tk.Label(path_frame, text="📂 Папка сохранения:", bg=BG_SURFACE, fg=SUBTEXT,
              font=("Segoe UI", 10)).pack(anchor="w")
-    out_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "Downloads"))
+    settings = load_settings()
+    default_dir = settings.get("last_download_dir") or os.path.join(os.getcwd(), "Downloads")
+    out_dir_var = tk.StringVar(value=default_dir)
     path_entry = tk.Entry(path_frame, textvariable=out_dir_var, bg="#0D1138", fg="white",
                           insertbackground="white", relief="flat", font=("Segoe UI", 10), state="disabled")
     path_entry.pack(side="left", fill="x", expand=True, ipady=4, pady=(4, 0))
 
     def choose_folder():
         d = filedialog.askdirectory(title="Выберите папку сохранения")
-        if d: out_dir_var.set(d)
+        if d:
+            out_dir_var.set(d)
+            s = load_settings()
+            s["last_download_dir"] = d
+            save_settings(s)
+
 
     choose_btn = tk.Button(path_frame, text="Выбрать", command=choose_folder); style_secondary(choose_btn)
     choose_btn.config(state="disabled"); choose_btn.pack(side="left", padx=(8, 0))
@@ -455,8 +561,8 @@ def main():
     kino_status = tk.Label(top_part, text="", bg=BG_SURFACE, fg=ACCENT_SECOND, font=("Segoe UI", 10))
     kino_status.pack(pady=(8, 4))
 
-    btn_login_uc = tk.Button(top_part, text="🔑 Войти в Kino.pub"); style_primary(btn_login_uc); btn_login_uc.pack(pady=(6, 8))
-    btn_download = tk.Button(top_part, text="⬇️ Скачать", state="disabled"); style_primary(btn_download); btn_download.pack(pady=(0, 10))
+
+    
 
     queue_part = tk.Frame(card_kino, bg=BG_SURFACE); queue_part.pack(fill="both", expand=True, padx=36, pady=(8, 12))
 
@@ -547,6 +653,48 @@ def main():
     # ========== DownloadManager ==========
     pool = DriverPool(max_drivers=2, status_cb=lambda m: kino_status.config(text=m[-80:], fg=ACCENT_SECOND))
     manager = DownloadManager(root, tree, active_counter, max_parallel=2, pool=pool)
+    def on_close():
+        logging.info("Запрошено закрытие окна, останавливаем загрузки и драйверы")
+
+        # Останавливаем новые загрузки
+        try:
+            manager.stop_all()
+        except Exception as e:
+            logging.error("Ошибка при stop_all(): %s", e)
+
+        # Пробуем закрыть драйверы пула
+        try:
+            if hasattr(pool, "close_all"):
+                pool.close_all()
+            elif hasattr(pool, "shutdown"):
+                pool.shutdown()
+        except Exception as e:
+            logging.error("Ошибка при закрытии DriverPool: %s", e)
+
+        # Добиваем процессы ffmpeg / Chromium (Windows)
+        if os.name == "nt":
+            for proc in ("ffmpeg.exe",
+                         "chromium.exe",          # ← основной процесс Chromium
+                         "chrome.exe",            # ← на всякий случай, если UC запустит так
+                         "undetected_chromedriver.exe",
+                         "chromedriver.exe"):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/IM", proc, "/F", "/T"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                except Exception as e:
+                    logging.error("taskkill %s failed: %s", proc, e)
+
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
     def login_to_kino():
         try:
             kino_status.config(text="⏳ Инициализация входа.", fg=ACCENT_SECOND)

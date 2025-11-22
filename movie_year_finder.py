@@ -5,21 +5,52 @@ import tkinter as tk
 import shutil
 import json
 import subprocess
+import re
+from bs4 import BeautifulSoup
 from auto_update import check_for_updates_async
 from download_manager import DownloadManager
-from uc_driver import DriverPool
-from tkinter import messagebox, filedialog
+from uc_driver import DriverPool, _safe_get_driver, KINOPUB_BASE
+from tkinter import messagebox, filedialog, simpledialog
 from pathlib import Path
 from file_actions import export_and_load_index, normalize_name
 from file_actions import load_index_from_efu
 from threaded_tasks import threaded_save_checked
 from kino_pub_downloader import login_to_kino as real_login_to_kino
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote_plus   # <── ДОБАВИЛИ quote_plus
+import webbrowser
+# === НОВОЕ: Selenium для реального поиска ===
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+# ===
 # --- Настройки (последняя папка сохранения и т.п.) ---
 SETTINGS_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "MediaSearch")
 os.makedirs(SETTINGS_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 
+YEAR_RE = re.compile(r"^(.*?)[\s\u00A0]*\((\d{4})\)\s*$")
+
+def split_title_year(line: str):
+    """
+    Принимает строку вида 'Название (2025)'.
+    Возвращает (title, year):
+      title: 'Название'
+      year: '2025'
+    Если года нет или строка пустая — возвращает (строка, None).
+    """
+    line = line.strip()
+    if not line:
+        return "", None
+
+    m = YEAR_RE.match(line)
+    if m:
+        title = m.group(1).strip()
+        year = m.group(2)
+        return title, year
+
+    # На всякий случай, если попадётся строка без (год)
+    return line, None
 
 def load_settings():
     try:
@@ -59,6 +90,9 @@ checked_vars = []
 index_loaded = False
 current_page = 1
 items_per_page = 100
+search_meta = {}
+search_driver = None
+kino_logged_in = False  # есть ли рабочий логин в Kino.pub
 
 # --- Палитра (чистая тёмная, без кругов) ---
 BRAND_SKY     = "#8AADD3"   # светло-голубой
@@ -286,10 +320,14 @@ def main():
     main_menu = tk.Frame(root, bg=BG_WINDOW)
     finder = tk.Frame(root, bg=BG_WINDOW)
     kino = tk.Frame(root, bg=BG_WINDOW)
-    for f in (main_menu, finder, kino):
+    kino_search = tk.Frame(root, bg=BG_WINDOW)  # новый экран поиска Kino.pub
+
+    for f in (main_menu, finder, kino, kino_search):
         f.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
         f.place_forget()
+
     main_menu.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+
 
     # ========== Главный экран (чистый тёмный) ==========
     card = tk.Frame(main_menu, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
@@ -343,7 +381,7 @@ def main():
 
     tk.Frame(main_menu, bg=BORDER, height=1).place(relx=0, rely=1.0, 
                                                    relwidth=1.0, y=-26, anchor="sw")
-    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.3",
+    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.4",
                             bg=BG_WINDOW, fg=ACCENT_SECOND, font=("Segoe UI Semibold", 9))
     footer_label.place(relx=1.0, rely=1.0, x=-12, y=-8, anchor="se")
 
@@ -428,8 +466,12 @@ def main():
     canvas.bind_all("<Button-5>", _on_mousewheel)
     root.bind("<Control-a>", lambda e: toggle_select_all())
     def on_key_return(event):
-        if finder.winfo_ismapped(): on_search()
+        if finder.winfo_ismapped():
+            on_search()
+        elif kino_search.winfo_ismapped():
+            search_one_title()
     root.bind("<Return>", on_key_return)
+
     if START_FULLSCREEN:
         # Esc — выйти из полноэкранного; F11 — вернуть
         root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
@@ -471,7 +513,7 @@ def main():
             "повторной работой с Kino.pub."
         )
 
-    # ========== Kino.pub Tools ==========
+        # ========== Kino.pub Tools ==========
     kino_top = tk.Frame(kino, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
     kino_top.pack(side="top", fill="x")
 
@@ -483,13 +525,29 @@ def main():
         font=("Segoe UI Semibold", 16),
     ).pack(side="left", padx=12, pady=10)
 
-    # кнопка "В меню"
+    # кнопка "В меню" (одна!)
     btn_back_kino = tk.Button(kino_top, text="← В меню")
     style_secondary(btn_back_kino)
     btn_back_kino.config(command=lambda: slide_switch(kino, main_menu, root, "left"))
     btn_back_kino.pack(side="left", padx=10)
 
-    # кнопка "Обновить профиль"
+    # кнопка "Поиск" — открывает отдельный экран поиска kino_search
+    btn_kino_search = tk.Button(kino_top, text="Поиск")
+    style_secondary(btn_kino_search)
+
+    def open_kino_search():
+        global kino_logged_in
+        if not kino_logged_in:
+            show_login_required()
+            return
+        slide_switch(kino, kino_search, root, "right")
+
+    btn_kino_search.config(command=open_kino_search)
+    btn_kino_search.pack(side="left", padx=6)
+
+
+
+    # кнопка "Обновить профиль" (тоже одна)
     btn_reset_profile = tk.Button(kino_top, text="Обновить профиль")
     style_secondary(btn_reset_profile)
     btn_reset_profile.config(command=reset_kino_profile)
@@ -499,6 +557,12 @@ def main():
     btn_login_uc = tk.Button(kino_top, text="Войти в Kino.pub")
     style_secondary(btn_login_uc)
     btn_login_uc.pack(side="right", padx=12)
+
+    # карточка загрузчика
+    card_kino = tk.Frame(kino, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
+    card_kino.place(relx=0.5, rely=0.555, anchor="center", width=680, height=640)
+    tk.Frame(card_kino, bg=ACCENT, height=3).pack(fill="x", side="top")
+
 
 
 
@@ -526,12 +590,12 @@ def main():
         insertbackground="white",
         relief="flat",
         font=("Segoe UI", 11),
-        state="disabled",
+        
     )
     kino_input.pack(side="left", fill="x", expand=True, ipady=4)
 
     # кнопка "Скачать" такого же размера/стиля, как "Выбрать"
-    btn_download = tk.Button(input_row, text="⬇️ Скачать", state="disabled")
+    btn_download = tk.Button(input_row, text="⬇️ Скачать")
     style_secondary(btn_download)          # тот же стиль, что и у "Выбрать"
     btn_download.pack(side="left", padx=(8, 0), ipady=2)
 
@@ -543,10 +607,15 @@ def main():
     default_dir = settings.get("last_download_dir") or os.path.join(os.getcwd(), "Downloads")
     out_dir_var = tk.StringVar(value=default_dir)
     path_entry = tk.Entry(path_frame, textvariable=out_dir_var, bg="#0D1138", fg="white",
-                          insertbackground="white", relief="flat", font=("Segoe UI", 10), state="disabled")
+                          insertbackground="white", relief="flat", font=("Segoe UI", 10), )
     path_entry.pack(side="left", fill="x", expand=True, ipady=4, pady=(4, 0))
 
     def choose_folder():
+        global kino_logged_in
+        if not kino_logged_in:
+            show_login_required()
+            return
+
         d = filedialog.askdirectory(title="Выберите папку сохранения")
         if d:
             out_dir_var.set(d)
@@ -555,8 +624,9 @@ def main():
             save_settings(s)
 
 
+
     choose_btn = tk.Button(path_frame, text="Выбрать", command=choose_folder); style_secondary(choose_btn)
-    choose_btn.config(state="disabled"); choose_btn.pack(side="left", padx=(8, 0))
+    choose_btn.pack(side="left", padx=(8, 0))
 
     kino_status = tk.Label(top_part, text="", bg=BG_SURFACE, fg=ACCENT_SECOND, font=("Segoe UI", 10))
     kino_status.pack(pady=(8, 4))
@@ -653,6 +723,30 @@ def main():
     # ========== DownloadManager ==========
     pool = DriverPool(max_drivers=2, status_cb=lambda m: kino_status.config(text=m[-80:], fg=ACCENT_SECOND))
     manager = DownloadManager(root, tree, active_counter, max_parallel=2, pool=pool)
+        # --- Драйвер для поиска кино (отдельный от менеджера загрузок) ---
+    def get_search_driver():
+        """
+        Отдельный UC-драйвер для поиска, на том же portable Chromium,
+        с теми же куками, скрытый (как в загрузчике).
+        """
+        global search_driver
+        if search_driver is None:
+            search_driver = _safe_get_driver(
+                status_cb=lambda msg: logging.info("[SEARCH] " + msg),
+                suppress=True,                 # прячем окно так же, как в DriverPool
+                profile_tag="run",             # рабочий профиль, не login
+                preload_kino_cookies=True,     # сразу подгружаем куки kino.pub
+                profile_name="UC_PROFILE_SEARCH"
+            )
+            try:
+                # лёгкий прогрев домена / CF на этом профиле
+                search_driver.get(KINOPUB_BASE)
+            except Exception as e:
+                logging.warning("SEARCH warmup failed: %s", e)
+
+        return search_driver
+
+
     def on_close():
         logging.info("Запрошено закрытие окна, останавливаем загрузки и драйверы")
 
@@ -671,11 +765,22 @@ def main():
         except Exception as e:
             logging.error("Ошибка при закрытии DriverPool: %s", e)
 
+        # --- НОВОЕ: закрыть драйвер поиска ---
+        global search_driver
+        try:
+            if search_driver is not None:
+                search_driver.quit()
+                search_driver = None
+
+        except Exception as e:
+            logging.error("Ошибка при закрытии search_driver: %s", e)
+        # ------------------------------------
+
         # Добиваем процессы ffmpeg / Chromium (Windows)
         if os.name == "nt":
             for proc in ("ffmpeg.exe",
-                         "chromium.exe",          # ← основной процесс Chromium
-                         "chrome.exe",            # ← на всякий случай, если UC запустит так
+                         "chromium.exe",
+                         "chrome.exe",
                          "undetected_chromedriver.exe",
                          "chromedriver.exe"):
                 try:
@@ -693,9 +798,65 @@ def main():
         except Exception:
             pass
 
+
     root.protocol("WM_DELETE_WINDOW", on_close)
+    def show_login_required():
+        """Окно в нашем стиле: нужно сначала войти в Kino.pub."""
+        dlg = tk.Toplevel(root)
+        dlg.title("Kino.pub")
+        try:
+            dlg.iconbitmap("icon.ico")
+        except Exception:
+            pass
+
+        dlg.transient(root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        dlg.configure(bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
+
+        # центрируем
+        dlg.update_idletasks()
+        w, h = 420, 180
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+        tk.Frame(dlg, bg=ACCENT, height=3).pack(fill="x", side="top")
+
+        body = tk.Frame(dlg, bg=BG_SURFACE)
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+
+        tk.Label(
+            body,
+            text="Сначала выполните вход в Kino.pub",
+            bg=BG_SURFACE,
+            fg=ACCENT,
+            font=("Segoe UI Semibold", 14),
+        ).pack(anchor="w", pady=(0, 6))
+
+        tk.Label(
+            body,
+            text="Нажмите кнопку «Войти в Kino.pub» в верхней панели,\n"
+                 "авторизуйтесь, и после этого функция станет доступна.",
+            bg=BG_SURFACE,
+            fg=SUBTEXT,
+            font=("Segoe UI", 10),
+            justify="left",
+        ).pack(anchor="w")
+
+        btn_row = tk.Frame(body, bg=BG_SURFACE)
+        btn_row.pack(fill="x", pady=(14, 0))
+        btn_ok = tk.Button(btn_row, text="Понятно", command=dlg.destroy)
+        style_primary(btn_ok)
+        btn_ok.pack(side="right")
+
+        dlg.bind("<Return>", lambda e: dlg.destroy())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
 
     def login_to_kino():
+        global kino_logged_in
         try:
             kino_status.config(text="⏳ Инициализация входа.", fg=ACCENT_SECOND)
 
@@ -704,18 +865,19 @@ def main():
             )
 
             if ok:
+                kino_logged_in = True
                 kino_status.config(text="✅ Вход успешно выполнен", fg=ACCENT_SECOND)
-                kino_input.config(state="normal")
-                choose_btn.config(state="normal")
-                path_entry.config(state="normal")
-                btn_download.config(state="normal")
             else:
+                kino_logged_in = False
                 kino_status.config(text="❌ Не удалось войти", fg="red")
                 messagebox.showerror("Ошибка", "❌ Не удалось войти в Kino.pub")
 
         except Exception as e:
+            kino_logged_in = False
             kino_status.config(text=f"Ошибка: {e}", fg="red")
             messagebox.showerror("Ошибка", f"Ошибка при авторизации: {e}")
+
+
 
     # после создания manager
     def _ui_set_title(item_id, text):
@@ -744,17 +906,28 @@ def main():
         reindex_rows()
 
     
-
-
-
     def start_kino_download():
+        global kino_logged_in
+        if not kino_logged_in:
+            show_login_required()
+            return
+
         q = kino_input.get().strip()
         if not q:
-            messagebox.showerror("Ошибка", "Введите запрос или URL карточки."); return
+            messagebox.showerror("Ошибка", "Введите запрос или URL карточки.")
+            return
+
         item_id = add_row(q, status="🟡 Подготовка...")
         kino_input.delete(0, "end")
         out_dir = out_dir_var.get().strip()
         manager.start_item(item_id, q, out_dir)
+
+    def on_kino_input_click(event):
+        if not kino_logged_in:
+            show_login_required()
+            return "break"  # не даём поставить курсор
+
+    kino_input.bind("<Button-1>", on_kino_input_click)
 
     def run_queue():
         out_dir = out_dir_var.get().strip()
@@ -773,6 +946,809 @@ def main():
     btn_login_uc.config(command=login_to_kino)
     btn_download.config(command=start_kino_download)
 
+        # ========== Экран поиска Kino.pub (kino_search) ==========
+    from tkinter import ttk  # на всякий случай, если выше не импортнулся
+
+    search_top = tk.Frame(kino_search, bg=BG_SURFACE,
+                          highlightbackground=BORDER, highlightthickness=1)
+    search_top.pack(side="top", fill="x")
+
+    tk.Label(
+        search_top,
+        text="Kino.pub Search",
+        bg=BG_SURFACE,
+        fg=ACCENT_SECOND,
+        font=("Segoe UI Semibold", 16),
+    ).pack(side="left", padx=12, pady=10)
+
+    # ← назад к загрузчику
+    btn_back_to_downloads = tk.Button(search_top, text="← К загрузкам")
+    style_secondary(btn_back_to_downloads)
+    btn_back_to_downloads.config(
+        command=lambda: slide_switch(kino_search, kino, root, "left")
+    )
+    btn_back_to_downloads.pack(side="left", padx=10)
+
+    # В главное меню
+    btn_back_to_menu_from_search = tk.Button(search_top, text="В меню")
+    style_secondary(btn_back_to_menu_from_search)
+    btn_back_to_menu_from_search.config(
+        command=lambda: slide_switch(kino_search, main_menu, root, "left")
+    )
+    btn_back_to_menu_from_search.pack(side="left", padx=6)
+
+    # Карточка поиска
+    card_search = tk.Frame(
+        kino_search,
+        bg=BG_SURFACE,
+        highlightbackground=BORDER,
+        highlightthickness=1,
+    )
+    card_search.place(relx=0.5, rely=0.54, anchor="center", width=780, height=640)
+    tk.Frame(card_search, bg=ACCENT, height=3).pack(fill="x", side="top")
+
+    top_s = tk.Frame(card_search, bg=BG_SURFACE)
+    top_s.pack(fill="x", pady=(18, 6))
+    tk.Label(
+        top_s,
+        text="🔎 Поиск фильмов на Kino.pub",
+        bg=BG_SURFACE,
+        fg=ACCENT,
+        font=("Segoe UI Semibold", 18),
+    ).pack(pady=(0, 4))
+    tk.Label(
+        top_s,
+        text="Новинки, поиск по названию или списком.\n"
+             "Выбранные результаты можно добавить в очередь загрузки.",
+        bg=BG_SURFACE,
+        fg=SUBTEXT,
+        font=("Segoe UI", 10),
+        wraplength=620,
+        justify="center",
+    ).pack()
+
+            # --- Поиск по одному названию ---
+    one_frame = tk.Frame(card_search, bg=BG_SURFACE)
+    one_frame.pack(fill="x", padx=40, pady=(12, 4))
+
+    tk.Label(
+        one_frame,
+        text="Название фильма:",
+        bg=BG_SURFACE,
+        fg=SUBTEXT,
+        font=("Segoe UI", 10),
+    ).pack(anchor="w")
+
+    one_row = tk.Frame(one_frame, bg=BG_SURFACE)
+    one_row.pack(fill="x", pady=(4, 0))
+
+    search_entry = tk.Entry(
+        one_row,
+        bg="#0D1138",
+        fg="white",
+        insertbackground="white",
+        relief="flat",
+        font=("Segoe UI", 11),
+    )
+    search_entry.pack(side="left", fill="x", expand=True, ipady=4)
+
+    
+
+    # Enter в этом поле запускает поиск
+    search_entry.bind("<Return>", lambda e: search_one_title())
+
+    search_entry.pack(side="left", fill="x", expand=True, ipady=4)
+    btn_search_one = tk.Button(one_row, text="Искать")
+    style_secondary(btn_search_one)
+    btn_search_one.pack(side="left", padx=(8, 0), ipady=2)
+
+        # --- Поиск по списку ---
+    list_frame = tk.Frame(card_search, bg=BG_SURFACE)
+    list_frame.pack(fill="x", padx=40, pady=(10, 4))
+    tk.Label(
+        list_frame,
+        text="Список названий (по одному в строке):",
+        bg=BG_SURFACE,
+        fg=SUBTEXT,
+        font=("Segoe UI", 10),
+    ).pack(anchor="w")
+    list_text = tk.Text(
+        list_frame,
+        height=4,
+        bg="#0D1138",
+        fg="white",
+        insertbackground="white",
+        relief="flat",
+        font=("Segoe UI", 10),
+        wrap="none",
+    )
+    list_text.pack(fill="x", pady=(4, 0))
+
+    # ряд кнопок: [Искать по списку] [TXT]
+    list_buttons_row = tk.Frame(list_frame, bg=BG_SURFACE)
+    list_buttons_row.pack(fill="x", pady=(4, 0))
+
+    # TXT будет правее
+    btn_search_txt = tk.Button(list_buttons_row, text="TXT")
+    style_secondary(btn_search_txt)
+    btn_search_txt.pack(side="right")
+
+    btn_search_list = tk.Button(list_buttons_row, text="Искать по списку")
+    style_secondary(btn_search_list)
+    btn_search_list.pack(side="right", padx=(8, 0))
+
+
+    # --- Новинки ---
+    news_frame = tk.Frame(card_search, bg=BG_SURFACE)
+    news_frame.pack(fill="x", padx=40, pady=(6, 0))
+    btn_news = tk.Button(news_frame, text="📅 Выгрузить новинки")
+    style_secondary(btn_news)
+    btn_news.pack(anchor="w")
+
+    # --- Таблица результатов поиска ---
+    results_container = tk.Frame(card_search, bg=BG_SURFACE)
+    results_container.pack(fill="both", expand=True, padx=32, pady=(10, 6))
+    res_scroll = tk.Scrollbar(results_container)
+    res_scroll.pack(side="right", fill="y")
+
+    # БЫЛО: res_columns = ("query", "title", "year", "url")
+    # СТАЛО: первая колонка — чекбокс
+    res_columns = ("chk", "query", "title", "year", "url")
+    tree_search = ttk.Treeview(
+        results_container,
+        columns=res_columns,
+        show="headings",
+        height=8,
+        yscrollcommand=res_scroll.set,
+    )
+    res_scroll.config(command=tree_search.yview)
+
+    tree_search.heading("chk",   text="",        anchor="center")
+    tree_search.heading("query", text="Запрос",  anchor="w")
+    tree_search.heading("title", text="Название", anchor="w")
+    tree_search.heading("year",  text="Год",     anchor="center")
+    tree_search.heading("url",   text="URL",     anchor="w")
+
+    tree_search.column("chk",   width=30,  anchor="center")
+    tree_search.column("query", width=150, anchor="w")
+    tree_search.column("title", width=260, anchor="w")
+    tree_search.column("year",  width=60,  anchor="center")
+    tree_search.column("url",   width=260, anchor="w")
+
+    tree_search.pack(fill="both", expand=True)
+
+    # --- состояние чекбоксов ---
+    checked_items: set[str] = set()
+
+    def toggle_check(item_id: str):
+        if not item_id:
+            return
+        vals = list(tree_search.item(item_id, "values"))
+        if not vals:
+            return
+
+        if item_id in checked_items:
+            checked_items.remove(item_id)
+            vals[0] = "☐"
+        else:
+            checked_items.add(item_id)
+            vals[0] = "☑"
+
+        tree_search.item(item_id, values=vals)
+
+    def on_tree_click(event):
+        """Клик по первой колонке — переключаем галочку."""
+        region = tree_search.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+
+        col = tree_search.identify_column(event.x)  # "#1", "#2", ...
+        row = tree_search.identify_row(event.y)
+        if not row:
+            return
+
+        if col == "#1":  # колонка chk
+            toggle_check(row)
+            return "break"  # не трогаем стандартный selection
+
+    tree_search.bind("<Button-1>", on_tree_click)
+
+
+
+
+    CARD_SELECTORS = [
+        ".item .item-title a[href*='/item/']",
+        "div.item-title a[href*='/item/']",
+        "a[href*='/item/view/']",
+    ]
+    def parse_kino_cards_from_soup(soup, max_results: int = 50):
+        """
+        Разбор HTML-страницы Kino.pub:
+        возвращает список (display_title, url, base_title, year).
+        Используется и для поиска, и для новинок.
+        """
+        results: list[tuple[str, str, str, str | None]] = []
+        seen_urls: set[str] = set()
+
+        # каждая карточка фильма/сериала
+        for card in soup.select("div.item-list div.item"):
+            # ссылка с названием
+            link = card.select_one("div.item-title a[href*='/item/']")
+            if not link:
+                continue
+
+            href = (link.get("href") or "").strip()
+            if not href:
+                continue
+            href = urljoin(KINOPUB_BASE, href)
+
+            if href in seen_urls:
+                continue
+            seen_urls.add(href)
+
+            # текст названия
+            text = (link.get("title") or link.get_text(" ", strip=True) or "").strip()
+            if not text:
+                continue
+
+            # --- ищем год: перебираем ВСЕ meta-блоки ---
+            year = None
+            for meta_div in card.select("div.item-author.text-ellipsis.text-muted"):
+                meta_text = meta_div.get_text(" ", strip=True)
+                m = re.search(r"\b(19|20)\d{2}\b", meta_text)
+                if m:
+                    year = m.group(0)
+                    break
+
+            # чистое название без (год) на всякий
+            base_title = re.sub(r"\s*\(\d{4}\)\s*", "", text).strip()
+            display_title = f"{base_title} ({year})" if year else base_title
+
+            results.append((display_title, href, base_title, year))
+
+            if len(results) >= max_results:
+                break
+
+        return results
+
+    def menu_open_in_browser():
+        sel = tree_search.selection()
+        if not sel:
+            return
+        for item in sel:
+            vals = tree_search.item(item, "values")
+            if len(vals) >= 5:
+                url = vals[4]
+                if url:
+                    try:
+                        webbrowser.open(url)
+                    except Exception as e:
+                        logging.error("Не удалось открыть URL %s: %s", url, e)
+
+
+    def on_search_row_double_click(event):
+        """
+        Двойной клик по строке:
+        - если по первой колонке (чекбокс) — переключаем галочку
+        - иначе открываем карточку в браузере
+        """
+        row = tree_search.identify_row(event.y)
+        if not row:
+            return
+
+        col = tree_search.identify_column(event.x)  # "#1", "#2", ...
+        if col == "#1":  # клик по чекбоксу
+            toggle_check(row)
+            return
+
+        vals = tree_search.item(row, "values")
+        # columns: (chk, query, title, year, url)
+        if len(vals) >= 5:
+            url = vals[4]
+            if url:
+                try:
+                    webbrowser.open(url)
+                except Exception as e:
+                    logging.error("Не удалось открыть URL %s: %s", url, e)
+
+    
+
+
+    # --- ПКМ по результатам поиска ---
+    search_menu = tk.Menu(tree_search, tearoff=0)
+
+    
+
+    def menu_add_to_queue():
+        add_selected_from_search()
+
+    search_menu.add_command(label="Открыть карточку в браузере",
+                            command=menu_open_in_browser)
+    search_menu.add_command(label="Скачать (добавить в очередь)",
+                            command=menu_add_to_queue)
+
+    def on_search_right_click(event):
+        item = tree_search.identify_row(event.y)
+        if not item:
+            return
+        # выделяем строку под курсором
+        if item not in tree_search.selection():
+            tree_search.selection_set(item)
+        search_menu.tk_popup(event.x_root, event.y_root)
+
+    tree_search.bind("<Button-3>", on_search_right_click)
+    tree_search.bind("<Double-1>", on_search_row_double_click)
+
+
+    def kino_search_real(title: str, max_results: int = 50):
+        """
+        Реальный поиск на Kino.pub через /item/search?query=...
+        Возвращает список кортежей:
+            (display_title, url, base_title, year)
+        Год берётся ТОЛЬКО из HTML карточки.
+        """
+        drv = get_search_driver()
+
+        q = quote_plus(title)
+        search_url = f"{KINOPUB_BASE}/item/search?query={q}"
+        logging.info(f"[SEARCH] GET {search_url}")
+
+        drv.get(search_url)
+
+        try:
+            WebDriverWait(drv, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            logging.warning("Страница поиска долго не загружается для запроса %s", title)
+
+        html = drv.page_source
+        soup = BeautifulSoup(html, "html.parser")
+
+        results = _parse_items_from_soup(soup, max_results=max_results)
+        logging.info("[SEARCH] '%s' -> %d результатов", title, len(results))
+        return results
+    def kino_fetch_news_page(page: int, max_results: int | None = None):
+        """
+        Вытаскивает список новинок с /new или /new?page=N.
+        """
+        drv = get_search_driver()
+
+        if page <= 1:
+            url = f"{KINOPUB_BASE}/new"
+        else:
+            url = f"{KINOPUB_BASE}/new?page={page}"
+
+        logging.info(f"[NEWS] GET {url}")
+        drv.get(url)
+
+        try:
+            WebDriverWait(drv, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            logging.warning("Страница новинок долго не загружается для страницы %s", page)
+
+        html = drv.page_source
+        soup = BeautifulSoup(html, "html.parser")
+
+        return _parse_items_from_soup(soup, max_results=max_results)
+
+
+    def _parse_items_from_soup(soup, max_results: int | None = None):
+        """
+        Общий парсер списка карточек Kino.pub.
+        Работает и для страницы поиска (/item/search),
+        и для новинок (/new), у которых другая вёрстка.
+
+        Возвращает список кортежей:
+            (display_title, url, base_title, year)
+        """
+        results: list[tuple[str, str, str, str | None]] = []
+        seen_urls: set[str] = set()
+
+        # Старый layout (поиск): div.item-list > div.item
+        cards = soup.select("div.item-list div.item")
+
+        # Новый layout (новинки): <div id="items"> ... <div class="item-info"> ... </div>
+        if not cards:
+            cards = list(soup.select("div#items div.item-info"))
+
+        for card in cards:
+            # ссылка с названием
+            link = card.select_one("div.item-title a[href*='/item/']")
+            if not link:
+                continue
+
+            href = (link.get("href") or "").strip()
+            if not href:
+                continue
+            href = urljoin(KINOPUB_BASE, href)
+
+            if href in seen_urls:
+                continue
+            seen_urls.add(href)
+
+            # текст названия
+            text = (link.get("title") or link.get_text(" ", strip=True) or "").strip()
+            if not text:
+                continue
+
+            # год можем не найти – для новинок это норм, тогда берём без года
+            year = None
+            for meta_div in card.select("div.item-author"):
+                meta_text = meta_div.get_text(" ", strip=True)
+                m = re.search(r"\b(19|20)\d{2}\b", meta_text)
+                if m:
+                    year = m.group(0)
+                    break
+
+            base_title = re.sub(r"\s*\(\d{4}\)\s*", "", text).strip()
+            display_title = f"{base_title} ({year})" if year else base_title
+
+            results.append((display_title, href, base_title, year))
+
+            if max_results is not None and len(results) >= max_results:
+                break
+
+        logging.info("[PARSE] найдено %d карточек", len(results))
+        return results
+
+
+
+    def search_one_title():
+        raw = search_entry.get().strip()
+
+        # отбрасываем "(1997)" – ищем только по названию
+        title, _ = split_title_year(raw)
+        if not title:
+            messagebox.showinfo("Поиск", "Введите название фильма.")
+            return
+
+        # очищаем старые результаты
+        for item in tree_search.get_children():
+            tree_search.delete(item)
+        search_meta.clear()
+
+        # ищем реальные карточки на сайте
+        results = kino_search_real(title, max_results=50)
+
+        if not results:
+            messagebox.showinfo("Поиск", f"По запросу '{raw}' ничего не найдено.")
+            return
+
+        for display_title, url, base_title, y in results:
+            item_id = tree_search.insert(
+                "",
+                "end",
+                values=("☐", raw, display_title, y or "", url),
+            )
+            search_meta[item_id] = {
+                "query": raw,
+                "title": base_title,
+                "year":  y,
+                "url":   url,
+            }
+
+
+
+
+    def search_by_list():
+        raw_lines = list_text.get("1.0", "end").splitlines()
+
+        # очищаем старые результаты
+        for item in tree_search.get_children():
+            tree_search.delete(item)
+        search_meta.clear()
+        checked_items.clear()
+
+        anything = False
+
+        for line in raw_lines:
+            original = line.strip()
+            if not original:
+                continue
+
+            # отбрасываем "(год)" из строки
+            title, _ = split_title_year(original)
+            if not title:
+                continue
+
+            # Для списка берём только лучший (первый) результат
+            results = kino_search_real(title, max_results=1)
+            if not results:
+                logging.info("Список: для '%s' ничего не найдено", line)
+                continue
+
+            display_title, url, base_title, y = results[0]
+            item_id = tree_search.insert(
+                "", "end",
+                values=("☐", original, display_title, y or "", url),
+            )
+            search_meta[item_id] = {
+                "query": original,
+                "title": base_title,
+                "year":  y,
+                "url":   url,
+            }
+            anything = True
+
+        if not anything:
+            messagebox.showinfo("Поиск", "Список пустой или по нему ничего не найдено.")
+
+
+    def search_from_txt():
+        path = filedialog.askopenfilename(
+            title="Выберите TXT со списком фильмов",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+            return
+
+        # заливаем содержимое в текстовое поле
+        list_text.delete("1.0", "end")
+        list_text.insert("1.0", content)
+
+        # и сразу ищем по списку
+        search_by_list()
+
+    btn_search_one.config(command=search_one_title)
+    btn_search_list.config(command=search_by_list)
+    btn_search_txt.config(command=search_from_txt)
+
+    def ask_news_range(parent) -> tuple[int | None, int | None]:
+        """
+        Красивый диалог 'Новинки Kino.pub': 
+        'Начать с страницы __  по страницу __'.
+        Возвращает (start_page, end_page) или (None, None), если Cancel.
+        """
+        dlg = tk.Toplevel(parent)
+        dlg.title("Новинки Kino.pub")
+        try:
+            dlg.iconbitmap("icon.ico")
+        except Exception:
+            pass
+
+        dlg.transient(parent)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        dlg.configure(bg=BG_SURFACE)
+
+        # центрируем
+        dlg.update_idletasks()
+        w, h = 360, 190
+        sw = parent.winfo_screenwidth()
+        sh = parent.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+        # --- контент ---
+        title_lbl = tk.Label(
+            dlg,
+            text="Новинки Kino.pub",
+            bg=BG_SURFACE,
+            fg=ACCENT,
+            font=("Segoe UI Semibold", 14),
+        )
+        title_lbl.pack(pady=(10, 4))
+
+        hint_lbl = tk.Label(
+            dlg,
+            text="Укажите диапазон страниц новинок:\n"
+                "например, с 2 по 5",
+            bg=BG_SURFACE,
+            fg=SUBTEXT,
+            font=("Segoe UI", 9),
+            justify="center",
+        )
+        hint_lbl.pack(pady=(0, 8))
+
+        row = tk.Frame(dlg, bg=BG_SURFACE)
+        row.pack(pady=(4, 4))
+
+        tk.Label(
+            row,
+            text="Начать с",
+            bg=BG_SURFACE,
+            fg=SUBTEXT,
+            font=("Segoe UI", 10),
+        ).pack(side="left", padx=(0, 4))
+
+        start_var = tk.StringVar(value="1")
+        start_entry = tk.Entry(
+            row,
+            textvariable=start_var,
+            width=4,
+            bg="#0D1138",
+            fg="white",
+            insertbackground="white",
+            relief="flat",
+            font=("Segoe UI", 11),
+            justify="center",
+        )
+        start_entry.pack(side="left")
+
+        tk.Label(
+            row,
+            text="по",
+            bg=BG_SURFACE,
+            fg=SUBTEXT,
+            font=("Segoe UI", 10),
+        ).pack(side="left", padx=4)
+
+        end_var = tk.StringVar(value="1")
+        end_entry = tk.Entry(
+            row,
+            textvariable=end_var,
+            width=4,
+            bg="#0D1138",
+            fg="white",
+            insertbackground="white",
+            relief="flat",
+            font=("Segoe UI", 11),
+            justify="center",
+        )
+        end_entry.pack(side="left")
+
+        error_lbl = tk.Label(
+            dlg,
+            text="",
+            bg=BG_SURFACE,
+            fg="red",
+            font=("Segoe UI", 9),
+        )
+        error_lbl.pack(pady=(2, 0))
+
+        res = {"start": None, "end": None}
+
+        def on_ok():
+            try:
+                s = int(start_var.get().strip())
+                e = int(end_var.get().strip())
+            except ValueError:
+                error_lbl.config(text="Страницы должны быть числами.")
+                return
+
+            if s < 1 or e < 1:
+                error_lbl.config(text="Номера страниц должны быть ≥ 1.")
+                return
+            if e > 999:
+                error_lbl.config(text="Максимум 999 страниц.")
+                return
+            if e < s:
+                error_lbl.config(text="Страница 'по' не может быть меньше 'с'.")
+                return
+
+            res["start"] = s
+            res["end"] = e
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg=BG_SURFACE)
+        btn_row.pack(pady=(10, 8))
+
+        btn_ok = tk.Button(btn_row, text="OK", width=10, command=on_ok)
+        style_primary(btn_ok)
+        btn_ok.pack(side="left", padx=6)
+
+        btn_cancel = tk.Button(btn_row, text="Cancel", width=10, command=on_cancel)
+        style_secondary(btn_cancel)
+        btn_cancel.pack(side="left", padx=6)
+
+        start_entry.focus_set()
+
+        def on_enter(event):
+            on_ok()
+
+        dlg.bind("<Return>", on_enter)
+        dlg.bind("<Escape>", lambda e: on_cancel())
+
+        parent.wait_window(dlg)
+        return res["start"], res["end"]
+
+    # новинки пока оставим заглушкой
+    def load_news():
+        # красивый диалог "с / по"
+        start_page, end_page = ask_news_range(root)
+        if start_page is None or end_page is None:
+            return
+
+        # очищаем старые результаты
+        for item in tree_search.get_children():
+            tree_search.delete(item)
+        search_meta.clear()
+
+        # тянем каждую страницу /new?page=N
+        for page in range(start_page, end_page + 1):
+            try:
+                page_results = kino_fetch_news_page(page, max_results=None)
+            except Exception as e:
+                logging.error("Ошибка при загрузке новинок страницы %s: %s", page, e)
+                continue
+
+            for display_title, url, base_title, year in page_results:
+                # то, что будет в колонке "Запрос"
+                query_label = f"стр {page}"   # или "Стр. {page}", как тебе больше нравится
+
+                # В таблицу для новинок кладём название без года
+                title_for_grid = base_title
+
+                item_id = tree_search.insert(
+                    "",
+                    "end",
+                    values=("☐", query_label, title_for_grid, year or "", url),
+                )
+                search_meta[item_id] = {
+                    "query": query_label,
+                    "title": base_title,
+                    "year":  year,
+                    "url":   url,
+                }
+
+
+
+
+        # НИКАКИХ messagebox'ов здесь.
+        # Если что-то пошло не так — смотри logs/app.log
+
+
+        # привязываем кнопку
+    btn_news.config(command=load_news)
+
+
+    # --- Кнопка: отправить выбранные в очередь скачивания ---
+    bottom_search = tk.Frame(card_search, bg=BG_SURFACE)
+    bottom_search.pack(fill="x", padx=32, pady=(4, 8))
+    btn_add_to_queue = tk.Button(bottom_search, text="Добавить выбранные в очередь")
+    style_primary(btn_add_to_queue)
+    btn_add_to_queue.pack(side="right")
+
+    def add_selected_from_search():
+        # если есть отмеченные галочками — используем их
+        if checked_items:
+            items = list(checked_items)
+        else:
+            # иначе — fallback на выделение строк
+            items = list(tree_search.selection())
+
+        if not items:
+            messagebox.showinfo(
+                "Очередь",
+                "Выберите хотя бы один результат поиска (поставьте галочки)."
+            )
+            return
+
+        out_dir = out_dir_var.get().strip()
+        for item in items:
+            vals = tree_search.item(item, "values")
+            # (chk, query, title, year, url)
+            if len(vals) < 5:
+                continue
+
+            _, _, display_title, year, url = vals
+
+            row_title = display_title
+            row_id = add_row(row_title, status="🟡 Подготовка...")
+
+            if hasattr(manager, "url_by_item"):
+                manager.url_by_item[row_id] = url
+
+            manager.start_item(row_id, url, out_dir)
+
+    btn_add_to_queue.config(command=add_selected_from_search)
+
+
+    
 
     def enable_clipboard_for_all(root, kino_input, btn_download):
         def on_ctrl_key(event, entry):

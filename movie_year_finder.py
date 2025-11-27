@@ -17,7 +17,8 @@ from file_actions import export_and_load_index, normalize_name, VIDEO_EXTENSIONS
 from file_actions import load_index_from_efu
 from threaded_tasks import threaded_save_checked
 from kino_pub_downloader import login_to_kino as real_login_to_kino
-from urllib.parse import urljoin, quote_plus   # <── ДОБАВИЛИ quote_plus
+from urllib.parse import urljoin, quote_plus   
+from ocr_tools import import_requests_from_images
 import webbrowser
 import sys 
 # === НОВОЕ: Selenium для реального поиска ===
@@ -503,7 +504,7 @@ def main():
 
     tk.Frame(main_menu, bg=BORDER, height=1).place(relx=0, rely=1.0, 
                                                    relwidth=1.0, y=-26, anchor="sw")
-    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.5",
+    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.6",
                             bg=BG_WINDOW, fg=ACCENT_SECOND, font=("Segoe UI Semibold", 9))
     footer_label.place(relx=1.0, rely=1.0, x=-12, y=-8, anchor="se")
 
@@ -638,7 +639,7 @@ def main():
     from tkinter import ttk  # на случай, если выше не импортнулось
 
     req_top = tk.Frame(requests, bg=BG_SURFACE,
-                       highlightbackground=BORDER, highlightthickness=1)
+                   highlightbackground=BORDER, highlightthickness=1)
     req_top.pack(side="top", fill="x", pady=(0, 6))
 
     tk.Label(
@@ -656,15 +657,27 @@ def main():
     )
     btn_back_req.pack(side="left", padx=10)
 
-    # дубль кнопки "Проверить NAS" для экрана запросов
+    # --- справа: Войти в Kino.pub / Распознать фото / Проверить NAS ---
+
+    # 1) Проверить NAS (крайняя справа)
     btn_req_nas = tk.Button(req_top, text="Проверить NAS")
     style_secondary(btn_req_nas)
     btn_req_nas.config(command=prepare_index)
-    btn_req_nas.pack(side="right", padx=12)
-    # кнопка "Войти в Kino.pub" на экране запросов
+    btn_req_nas.pack(side="right", padx=(8, 12))
+
+    # 2) Распознать фото
+    btn_req_ocr_top = tk.Button(req_top, text="Распознать фото")
+    style_secondary(btn_req_ocr_top)
+    btn_req_ocr_top.config(
+        command=lambda: import_requests_from_images(req_text)
+    )
+    btn_req_ocr_top.pack(side="right", padx=8)
+
+    # 3) Войти в Kino.pub
     btn_req_login = tk.Button(req_top, text="Войти в Kino.pub")
     style_secondary(btn_req_login)
     btn_req_login.pack(side="right", padx=8)
+
 
     # --- Тело экрана ---
     req_body = tk.Frame(requests, bg=BG_WINDOW)
@@ -700,22 +713,21 @@ def main():
     req_text.pack(fill="both", expand=True, pady=(4, 0))
 
     req_btn_row = tk.Frame(req_left, bg=BG_WINDOW)
-    req_btn_row.pack(fill="x", pady=(6, 0))
+    req_btn_row.pack(anchor="w", pady=(6, 0))  # можно без fill="x"
 
-    # Кнопка "Проверить в медиатеке"
     btn_req_check = tk.Button(req_btn_row, text="Проверить в медиатеке")
     style_secondary(btn_req_check)
-    btn_req_check.pack(side="left", padx=(0, 8))
+    btn_req_check.pack(side="left")
 
-    # Кнопка "Очистить"
     btn_req_clear = tk.Button(req_btn_row, text="Очистить")
     style_secondary(btn_req_clear)
-    btn_req_clear.pack(side="left", padx=(0, 8))
+    btn_req_clear.pack(side="left", padx=(8, 0))
 
-    # Кнопка "Загрузить из TXT"
     btn_req_txt = tk.Button(req_btn_row, text="Загрузить из TXT")
     style_secondary(btn_req_txt)
-    btn_req_txt.pack(side="left")
+    btn_req_txt.pack(side="left", padx=(8, 0))
+
+
 
     # Правая часть: результаты
     req_right = tk.Frame(req_body, bg=BG_WINDOW)
@@ -898,17 +910,13 @@ def main():
         popup.configure(bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
 
         W, H = 900, 420
-        try:
-            bbox = req_tree.bbox(item_id, column="path") or req_tree.bbox(item_id)
-            if bbox:
-                x, y, w, h = bbox
-                px = req_tree.winfo_rootx() + x
-                py = req_tree.winfo_rooty() + y + h
-                popup.geometry(f"{W}x{H}+{px}+{py}")
-            else:
-                popup.geometry(f"{W}x{H}")
-        except Exception:
-            popup.geometry(f"{W}x{H}")
+        popup.update_idletasks()
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        x = (sw - W) // 2
+        y = (sh - H) // 2
+        popup.geometry(f"{W}x{H}+{x}+{y}")
+
 
         tk.Frame(popup, bg=ACCENT, height=3).pack(fill="x", side="top")
 
@@ -1059,18 +1067,20 @@ def main():
     )
     req_summary.pack(side="left", padx=8)
 
-    # ⚡ Новые кнопки
-    btn_req_dl_selected = tk.Button(req_footer, text="Скачать выбранные")
-    style_secondary(btn_req_dl_selected)
-    btn_req_dl_selected.pack(side="right", padx=8)
+    # Блок кнопок справа: Скачать выбранные / Найти выбранные / Найти все / Скачать все
+    req_btn_bar = tk.Frame(req_footer, bg=BG_SURFACE)
+    req_btn_bar.pack(side="right", padx=8)
 
-    btn_req_dl_missing = tk.Button(req_footer, text="Скачать не найденные")
-    style_secondary(btn_req_dl_missing)
-    btn_req_dl_missing.pack(side="right", padx=8)
+    btn_req_find_all = tk.Button(req_btn_bar, text="Найти все")
+    style_secondary(btn_req_find_all)
+    btn_req_find_all.pack(side="right", padx=(6, 0))
 
-    btn_req_copy = tk.Button(req_footer, text="Скопировать выделенные")
-    style_secondary(btn_req_copy)
-    btn_req_copy.pack(side="right", padx=8)
+    btn_req_find_selected = tk.Button(req_btn_bar, text="Найти выбранные")
+    style_secondary(btn_req_find_selected)
+    btn_req_find_selected.pack(side="right", padx=(6, 0))
+
+
+
 
 
     # --- Логика работы с запросами ---
@@ -1299,6 +1309,39 @@ def main():
         req_summary.config(
             text=f"Всего запросов: {total} | найдено: {found_cnt} | нет в медиатеке: {missing}"
         )
+    def find_selected_requests():
+        """
+        Перепроверить только отмеченные галочками строки:
+        берём их original-строки, перезаписываем список слева
+        и вызываем check_requests().
+        """
+        items = list(req_checked_items)
+        if not items:
+            messagebox.showinfo(
+                "Медиатека",
+                "Отметьте галочкой слева хотя бы один запрос."
+            )
+            return
+
+        lines: list[str] = []
+        for item_id in items:
+            meta = request_rows_meta.get(item_id)
+            if not meta:
+                continue
+            original = (meta.get("original") or "").strip()
+            if original:
+                lines.append(original)
+
+        if not lines:
+            messagebox.showinfo(
+                "Медиатека",
+                "Не удалось собрать выбранные запросы."
+            )
+            return
+
+        req_text.delete("1.0", "end")
+        req_text.insert("1.0", "\n".join(lines))
+        check_requests()
 
     def copy_selected_requests():
         """Скопировать файлы из отмеченных строк (основной путь + метафайлы, если включено)."""
@@ -1413,7 +1456,62 @@ def main():
 
         threading.Thread(target=worker, daemon=True).start()
 
-    btn_req_copy.config(command=copy_selected_requests)
+    def send_requests_to_search(mode: str):
+        """
+        Отправить запросы с этого экрана на экран поиска Kino.pub.
+
+        mode = 'selected' -> только отмеченные галочками строки
+        mode = 'all'      -> все строки таблицы
+        """
+        if not kino_logged_in:
+            show_login_required()
+            return
+
+        if mode == "selected":
+            items = list(req_checked_items)
+            if not items:
+                messagebox.showinfo(
+                    "Поиск",
+                    "Отметьте галочкой слева хотя бы один запрос."
+                )
+                return
+        else:  # "all"
+            items = list(req_tree.get_children())
+            if not items:
+                messagebox.showinfo("Поиск", "Нет строк для поиска.")
+                return
+
+        lines: list[str] = []
+        used: set[str] = set()
+
+        for item_id in items:
+            meta = request_rows_meta.get(item_id)
+            original = (meta.get("original") or "").strip() if meta else ""
+            if not original:
+                vals = req_tree.item(item_id, "values")
+                if len(vals) >= 2:
+                    original = str(vals[1]).strip()
+            if not original:
+                continue
+            if original not in used:
+                used.add(original)
+                lines.append(original)
+
+        if not lines:
+            messagebox.showinfo("Поиск", "Не удалось собрать названия для поиска.")
+            return
+
+        # заливаем список в поле поиска на экране Kino.pub
+        list_text.delete("1.0", "end")
+        list_text.insert("1.0", "\n".join(lines))
+
+        # 1) сначала переключаемся на экран поиска
+        slide_switch(requests, kino_search, root, "right")
+
+        # 2) А УЖЕ ПОТОМ запускаем поиск по списку,
+        #    когда Tk вернётся в главный цикл
+        root.after(150, search_all_from_list)
+
 
     def clear_requests():
         req_text.delete("1.0", "end")
@@ -1443,119 +1541,16 @@ def main():
         req_text.delete("1.0", "end")
         req_text.insert("1.0", content)
         
-    def download_requests(mode: str):
-        """
-        mode = 'selected'  -> использовать строки, отмеченные галочками
-        mode = 'missing'   -> использовать строки со статусом 'Нет в медиатеке'
-        """
-
-        if not kino_logged_in:
-            show_login_required()
-            return
-
-        if mode == "selected":
-            items = list(req_checked_items)
-            if not items:
-                messagebox.showinfo("Загрузка",
-                                    "Отметьте галочкой слева хотя бы один фильм.")
-                return
-        elif mode == "missing":
-            items = []
-            for item in req_tree.get_children():
-                vals = req_tree.item(item, "values")
-                if len(vals) >= 3 and "Нет в медиатеке" in str(vals[2]):
-                    items.append(item)
-            if not items:
-                messagebox.showinfo("Загрузка",
-                                    "Нет строк со статусом «Нет в медиатеке».")
-                return
-        else:
-            return
-
-        out_dir = out_dir_var.get().strip()
-        if not out_dir:
-            messagebox.showerror("Загрузка",
-                                "Не указана папка сохранения в блоке Kino.pub.")
-            return
-
-        added = 0
-        not_found_online = 0
-
-        for item_id in items:
-            meta = request_rows_meta.get(item_id) or {}
-
-            original = (meta.get("original") or "").strip()
-            if not original:
-                vals = req_tree.item(item_id, "values")
-                if len(vals) >= 2:
-                    original = str(vals[1]).strip()
-            if not original:
-                continue
-
-            title, _ = split_title_year(original)
-            title = title or original
-            if not title:
-                continue
-
-            url = None
-            display_title = None
-            base_title = None
-            year = None
-            eng_title = None
-
-            pre_url = meta.get("kino_url")
-            if pre_url:
-                url = pre_url
-                vals = req_tree.item(item_id, "values")
-                if len(vals) >= 4:
-                    display_title = str(vals[3]) or title
-                else:
-                    display_title = title
-            else:
-                try:
-                    results = kino_search_real(title, max_results=1)
-                except Exception as e:
-                    logging.error("kino_search_real('%s') failed: %s", title, e)
-                    continue
-
-                if not results:
-                    not_found_online += 1
-                    continue
-
-                display_title, url, base_title, year, eng_title = results[0]
-
-            if not url:
-                not_found_online += 1
-                continue
-
-            shown_title = display_title
-            if eng_title:
-                shown_title = f"{display_title} / {eng_title}"
-
-            row_id = add_row(shown_title, status="🟡 Подготовка...")
-            if hasattr(manager, "url_by_item"):
-                manager.url_by_item[row_id] = url
-
-            manager.start_item(row_id, url, out_dir)
-            added += 1
-
-        messagebox.showinfo(
-            "Kino.pub",
-            f"В очередь загрузки добавлено: {added}\n"
-            f"Не найдено на Kino.pub: {not_found_online}"
-        )
+    
 
 
     btn_req_check.config(command=check_requests)
     btn_req_clear.config(command=clear_requests)
     btn_req_txt.config(command=load_requests_from_txt)
-    btn_req_copy.config(command=copy_selected_requests)
-    btn_req_dl_selected.config(
-        command=lambda: download_requests("selected")
-    )
-    btn_req_dl_missing.config(
-        command=lambda: download_requests("missing")
-    )
+
+    # нижние кнопки: гоняем запросы на экран поиска Kino.pub
+    btn_req_find_selected.config(command=lambda: send_requests_to_search("selected"))
+    btn_req_find_all.config(command=lambda: send_requests_to_search("all"))
 
 
         # ========== Kino.pub Tools ==========
@@ -1751,6 +1746,7 @@ def main():
     counter_bar = tk.Frame(queue_part, bg=BG_SURFACE); counter_bar.pack(fill="x", pady=(2, 0))
     active_counter = tk.Label(counter_bar, text="Активно: 0 / 2", bg=BG_SURFACE, fg=SUBTEXT, font=("Segoe UI", 10))
     active_counter.pack(side="right", padx=6)
+    
 
     # ========== DownloadManager ==========
     pool = DriverPool(max_drivers=2, status_cb=lambda m: kino_status.config(text=m[-80:], fg=ACCENT_SECOND))
@@ -1956,9 +1952,10 @@ def main():
         btn_run.config(command=run_queue)
         btn_stop.config(command=stop_queue)
 
-    btn_login_uc.config(command=login_to_kino)
-    btn_req_login.config(command=login_to_kino)  # ← новая кнопка на экране запросов
+    btn_login_uc.config(command=login_to_kino)      # логин на экране Kino.pub
+    btn_req_login.config(command=login_to_kino)     # логин на экране запросов
     btn_download.config(command=start_kino_download)
+
 
         # ========== Экран поиска Kino.pub (kino_search) ==========
     from tkinter import ttk  # на всякий случай, если выше не импортнулся
@@ -2084,18 +2081,19 @@ def main():
     )
     list_text.pack(fill="x", pady=(4, 0))
 
-    # ряд кнопок: [Искать по списку] [TXT]
     list_buttons_row = tk.Frame(list_frame, bg=BG_SURFACE)
     list_buttons_row.pack(fill="x", pady=(4, 0))
 
-    # TXT будет правее
+    # слева одна кнопка "Поиск списка", справа — TXT
+    btn_search_list = tk.Button(list_buttons_row, text="Поиск списка")
+    style_secondary(btn_search_list)
+    btn_search_list.pack(side="left")
+
     btn_search_txt = tk.Button(list_buttons_row, text="TXT")
     style_secondary(btn_search_txt)
     btn_search_txt.pack(side="right")
 
-    btn_search_list = tk.Button(list_buttons_row, text="Искать по списку")
-    style_secondary(btn_search_list)
-    btn_search_list.pack(side="right", padx=(8, 0))
+
 
 
     # --- Новинки ---
@@ -2489,10 +2487,12 @@ def main():
                 "eng_title": eng_title,
             }
 
-    def search_by_list():
-        raw_lines = list_text.get("1.0", "end").splitlines()
-
-        # очищаем старые результаты
+    def _search_for_title_list(titles: list[str]):
+        """
+        Общий хелпер: делает то же самое, что search_one_title,
+        но для нескольких запросов подряд.
+        """
+        # очищаем таблицу
         for item in tree_search.get_children():
             tree_search.delete(item)
         search_meta.clear()
@@ -2500,45 +2500,74 @@ def main():
 
         anything = False
 
-        for line in raw_lines:
-            original = line.strip()
+        for original in titles:
+            original = original.strip()
             if not original:
                 continue
 
-            # отбрасываем "(год)" из строки
             title, _ = split_title_year(original)
+            title = title or original
             if not title:
                 continue
 
-            # Для списка берём только лучший (первый) результат
-            results = kino_search_real(title, max_results=1)
-            if not results:
-                logging.info("Список: для '%s' ничего не найдено", line)
+            try:
+                results = kino_search_real(title, max_results=50)
+            except Exception as e:
+                logging.error("kino_search_real('%s') failed: %s", title, e)
                 continue
 
-            display_title, url, base_title, y, eng_title = results[0]
+            if not results:
+                logging.info("Список: для '%s' ничего не найдено", original)
+                continue
 
-            shown_title = display_title
-            if eng_title:
-                shown_title = f"{display_title} / {eng_title}"
+            for display_title, url, base_title, y, eng_title in results:
+                shown_title = display_title
+                if eng_title:
+                    shown_title = f"{display_title} / {eng_title}"
 
-            item_id = tree_search.insert(
-                "", "end",
-                values=("☐", original, shown_title, y or "", url),
-            )
-            search_meta[item_id] = {
-                "query": original,
-                "title": base_title,
-                "year":  y,
-                "url":   url,
-                "eng_title": eng_title,
-            }
+                item_id = tree_search.insert(
+                    "",
+                    "end",
+                    values=("☐", original, shown_title, y or "", url),
+                )
+                search_meta[item_id] = {
+                    "query": original,
+                    "title": base_title,
+                    "year":  y,
+                    "url":   url,
+                    "eng_title": eng_title,
+                }
 
-            anything = True
+                anything = True
 
         if not anything:
-            messagebox.showinfo("Поиск", "Список пустой или по нему ничего не найдено.")
+            messagebox.showinfo("Поиск", "По списку ничего не найдено.")
 
+    def search_all_from_list():
+        """Найти по ВСЕМ строкам списка."""
+        raw_lines = list_text.get("1.0", "end").splitlines()
+        titles = [line.strip() for line in raw_lines if line.strip()]
+        if not titles:
+            messagebox.showinfo("Поиск", "Список пустой.")
+            return
+
+        _search_for_title_list(titles)
+
+    def search_selected_from_list():
+        """Найти только по выделенным строкам в текстовом поле."""
+        try:
+            selection = list_text.get("sel.first", "sel.last")
+        except tk.TclError:
+            messagebox.showinfo("Поиск", "Сначала выделите строки в списке.")
+            return
+
+        raw_lines = selection.splitlines()
+        titles = [line.strip() for line in raw_lines if line.strip()]
+        if not titles:
+            messagebox.showinfo("Поиск", "Выделенный фрагмент пустой.")
+            return
+
+        _search_for_title_list(titles)
 
     def search_from_txt():
         path = filedialog.askopenfilename(
@@ -2554,16 +2583,17 @@ def main():
             messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
 
-        # заливаем содержимое в текстовое поле
         list_text.delete("1.0", "end")
         list_text.insert("1.0", content)
+        # после загрузки из файла сразу ищем по всему списку
+        search_all_from_list()
 
-        # и сразу ищем по списку
-        search_by_list()
 
     btn_search_one.config(command=search_one_title)
-    btn_search_list.config(command=search_by_list)
+    btn_search_list.config(command=search_all_from_list)
+    
     btn_search_txt.config(command=search_from_txt)
+
 
     def ask_news_range(parent) -> tuple[int | None, int | None]:
         """
@@ -2806,80 +2836,83 @@ def main():
 
             manager.start_item(row_id, url, out_dir)
     def send_selected_to_requests():
-            """
-            Забрать текущие результаты поиска / новинок и
-            отправить их в экран 'Работа с запросами'.
+        """
+        Забрать ОТМЕЧЕННЫЕ результаты поиска / новинок и
+        отправить их в экран 'Работа с запросами' + сразу
+        запустить проверку в медиатеке.
+        """
+        global kino_urls_for_requests
 
-            Если есть галочки — используем только отмеченные.
-            Если галочек нет — берём все строки таблицы.
-            Формат строки:
-            - если знаем год:  'Название (Год)'
-            - если года нет:   'Название'
-            """
-            global kino_urls_for_requests  
-            kino_urls_for_requests.clear()
-            # 1) какие строки брать
-            if checked_items:
-                items = list(checked_items)
+        # 1) Берём только те, у кого стоит галочка
+        if not checked_items:
+            messagebox.showinfo(
+                "Медиатека",
+                "Поставьте галочки у результатов, которые хотите проверить."
+            )
+            return
+
+        items = list(checked_items)
+
+        # 2) Чистим экран запросов (текст + таблицу), а затем
+        #    готовим новую мапу названий -> URL
+        clear_requests()              # очищает req_text, req_tree и т.п.
+        kino_urls_for_requests.clear()
+
+        lines: list[str] = []
+        used: set[str] = set()
+
+        for item in items:
+            meta = search_meta.get(item)
+
+            if meta:
+                base_title = (meta.get("title") or "").strip()
+                year = (meta.get("year") or "") or ""
+                url = meta.get("url")
             else:
-                items = list(tree_search.get_children())
-
-            if not items:
-                messagebox.showinfo(
-                    "Медиатека",
-                    "Нет результатов для передачи в список запросов."
-                )
-                return
-
-            lines: list[str] = []
-            used: set[str] = set()
-
-            for item in items:
-                meta = search_meta.get(item)
-
-                if meta:
-                    base_title = (meta.get("title") or "").strip()
-                    year = (meta.get("year") or "") or ""
-                else:
-                    # запасной вариант — читаем прямо из таблицы
-                    vals = tree_search.item(item, "values")
-                    # (chk, query, title, year, url)
-                    if len(vals) < 3:
-                        continue
-                    base_title = str(vals[2]).strip()
-                    year = str(vals[3]).strip() if len(vals) >= 4 else ""
-
-                if not base_title:
+                # запасной вариант — читаем прямо из таблицы
+                vals = tree_search.item(item, "values")
+                # (chk, query, title, year, url)
+                if len(vals) < 3:
                     continue
+                base_title = str(vals[2]).strip()
+                year = str(vals[3]).strip() if len(vals) >= 4 else ""
+                url = vals[4] if len(vals) >= 5 else ""
 
-                # ВАЖНО:
-                # если года нет (новинки) — ищем только по названию
-                if year:
-                    line = f"{base_title} ({year})"
-                else:
-                    line = base_title
+            if not base_title:
+                continue
 
-                if line not in used:
-                    used.add(line)
-                    lines.append(line)
-                    # НОВОЕ: если у нас есть URL — запомнить его для этой строки
-                    if meta:
-                        url = meta.get("url")
-                        if url:
-                            kino_urls_for_requests[line] = url
-            if not lines:
-                messagebox.showinfo(
-                    "Медиатека",
-                    "Не удалось собрать названия для запросов."
-                )
-                return
+            # если знаем год — "Название (Год)", если нет — просто название
+            if year:
+                line = f"{base_title} ({year})"
+            else:
+                line = base_title
 
-            # 2) заливаем список в экран запросов
-            clear_requests()
-            req_text.insert("1.0", "\n".join(lines))
+            if line in used:
+                continue
 
-            # 3) переключаем экран
-            slide_switch(kino_search, requests, root, "right")   
+            used.add(line)
+            lines.append(line)
+
+            # сохраним URL для этой строки, чтобы на экране запросов знать,
+            # какая карточка kino.pub к этому фильму относилась
+            if url:
+                kino_urls_for_requests[line] = url
+
+        if not lines:
+            messagebox.showinfo(
+                "Медиатека",
+                "Не удалось собрать названия для запросов."
+            )
+            return
+
+        # 3) Заливаем список в текстовое поле экрана запросов
+        req_text.insert("1.0", "\n".join(lines))
+
+        # 4) Переключаем экран поиска -> экран запросов
+        slide_switch(kino_search, requests, root, "right")
+
+        # 5) ДАЁМ Tk отрисовать экран и запускаем check_requests
+        root.after(150, check_requests)
 
     btn_add_to_queue.config(command=add_selected_from_search)
     btn_to_requests.config(command=send_selected_to_requests)

@@ -166,7 +166,10 @@ CARD_SELECTORS = [
 
 # ---------- утилиты ----------
 def sanitize_filename(name: str) -> str:
-    return re.sub(r"[^\w\- ]", "", name).strip().replace(" ", "_")
+    name = re.sub(r"[^\w\- ]", " ", name)   # всё лишнее → пробел
+    name = re.sub(r"\s{2,}", " ", name)     # схлопываем
+    return name.strip(" .")
+
 
 
 def _detect_major_via_cmd(exe_path: str) -> int | None:

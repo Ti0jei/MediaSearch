@@ -26,6 +26,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import threading
+from kino_hls import set_reencode as set_hls_reencode
+
 META_EXTENSIONS = set(RELATED_EXTENSIONS) | {
     ".nfo", ".xml", ".jpg", ".jpeg", ".png", ".webp", ".tbn"
 }
@@ -503,7 +505,7 @@ def main():
 
     tk.Frame(main_menu, bg=BORDER, height=1).place(relx=0, rely=1.0, 
                                                    relwidth=1.0, y=-26, anchor="sw")
-    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.5",
+    footer_label = tk.Label(main_menu, text="Created by Ti0jei v1.0.6",
                             bg=BG_WINDOW, fg=ACCENT_SECOND, font=("Segoe UI Semibold", 9))
     footer_label.place(relx=1.0, rely=1.0, x=-12, y=-8, anchor="se")
 
@@ -1060,17 +1062,18 @@ def main():
     req_summary.pack(side="left", padx=8)
 
     # ⚡ Новые кнопки
-    btn_req_dl_selected = tk.Button(req_footer, text="Скачать выбранные")
+    btn_req_dl_selected = tk.Button(req_footer, text="Найти выбранные")
     style_secondary(btn_req_dl_selected)
     btn_req_dl_selected.pack(side="right", padx=8)
 
-    btn_req_dl_missing = tk.Button(req_footer, text="Скачать не найденные")
+    btn_req_dl_missing = tk.Button(req_footer, text="Найти не найденные")
     style_secondary(btn_req_dl_missing)
     btn_req_dl_missing.pack(side="right", padx=8)
 
     btn_req_copy = tk.Button(req_footer, text="Скопировать выделенные")
     style_secondary(btn_req_copy)
     btn_req_copy.pack(side="right", padx=8)
+
 
 
     # --- Логика работы с запросами ---
@@ -1189,6 +1192,7 @@ def main():
 
         lines = req_text.get("1.0", "end").splitlines()
 
+        # чистим таблицу и служебные структуры
         for item in req_tree.get_children():
             req_tree.delete(item)
         request_rows_meta.clear()
@@ -1196,21 +1200,25 @@ def main():
 
         index_map = build_index_map()
 
-        total = 0
-        found_cnt = 0
+        total = 0         # всего запросов (непустых строк)
+        found_cnt = 0     # «Найдено»
+        missing_cnt = 0   # «Нет в медиатеке»
 
         for line in lines:
             original = line.strip()
             if not original:
                 continue
             total += 1
+
             pre_url = kino_urls_for_requests.get(original)
+
             title, req_year = split_title_year(original)
             title = title or original
 
             norm_title = normalize_name(cleanup_title(title))
             matches = index_map.get(norm_title, [])
 
+            # небольшие вариации названия
             if not matches and "," in original:
                 no_comma = original.replace(",", " ")
                 alt_title, _ = split_title_year(no_comma)
@@ -1226,6 +1234,7 @@ def main():
 
             was_fuzzy = False
             if not matches:
+                # пробуем «похожий» поиск
                 key_for_fuzzy = norm_title
                 all_keys = list(index_map.keys())
                 close = difflib.get_close_matches(
@@ -1246,16 +1255,16 @@ def main():
 
             if not matches:
                 status = "❌ Нет в медиатеке"
-                display_title = ""
+                missing_cnt += 1
             else:
                 videos = [r for r in matches if r["is_video"]]
                 metas  = [r for r in matches if r["is_meta"]]
 
+                # выбираем конкретный релиз
                 for rec in videos:
                     if req_year and rec["year"] == req_year:
                         chosen = rec
                         break
-
                 if chosen is None:
                     chosen = videos[0] if videos else matches[0]
 
@@ -1290,15 +1299,16 @@ def main():
                     videos.index(chosen) if (chosen and chosen in videos) else None
                 ),
                 "paths_last": [],
-                "kino_url": pre_url, 
+                "kino_url": pre_url,
             }
 
             update_row_paths(item_id)
 
-        missing = max(0, total - found_cnt)
         req_summary.config(
-            text=f"Всего запросов: {total} | найдено: {found_cnt} | нет в медиатеке: {missing}"
+            text=f"Всего запросов: {total} | найдено: {found_cnt} | нет в медиатеке: {missing_cnt}"
         )
+
+
 
     def copy_selected_requests():
         """Скопировать файлы из отмеченных строк (основной путь + метафайлы, если включено)."""
@@ -1415,16 +1425,22 @@ def main():
 
     btn_req_copy.config(command=copy_selected_requests)
 
-    def clear_requests():
+    def clear_requests(reset_urls: bool = True):
         req_text.delete("1.0", "end")
         for item in req_tree.get_children():
             req_tree.delete(item)
+
         req_checked_items.clear()
         request_rows_meta.clear()
-        kino_urls_for_requests.clear() 
+
+        if reset_urls:
+            # Полная очистка: забываем привязки "строка -> kino_url"
+            kino_urls_for_requests.clear()
+
         req_summary.config(
             text="Всего запросов: 0 | найдено: 0 | нет в медиатеке: 0"
         )
+
 
     def load_requests_from_txt():
         path = filedialog.askopenfilename(
@@ -1440,47 +1456,66 @@ def main():
             messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
 
-        req_text.delete("1.0", "end")
+        clear_requests(True)               # <-- вот сюда
         req_text.insert("1.0", content)
-        
-    def download_requests(mode: str):
+
+    def search_requests(mode: str):
         """
         mode = 'selected'  -> использовать строки, отмеченные галочками
-        mode = 'missing'   -> использовать строки со статусом 'Нет в медиатеке'
+        mode = 'missing'   -> использовать строки, которые считаются «не найденными»
+
+        1) Если у строк есть сохранённые kino_url (списки пришли из новинок/поиска) —
+           переносим их во вкладку поиска Kino.pub и НЕ дёргаем Selenium лишний раз.
+        2) Если ссылок нет (список введён/загружен вручную) —
+           делаем поиск на Kino.pub по названиям через search_by_list().
         """
+        global kino_logged_in
 
         if not kino_logged_in:
             show_login_required()
             return
 
+        # 1) Определяем, какие строки брать
         if mode == "selected":
             items = list(req_checked_items)
             if not items:
-                messagebox.showinfo("Загрузка",
-                                    "Отметьте галочкой слева хотя бы один фильм.")
+                messagebox.showinfo(
+                    "Поиск",
+                    "Отметьте галочкой слева хотя бы один фильм."
+                )
                 return
+
         elif mode == "missing":
-            items = []
+            items: list[str] = []
             for item in req_tree.get_children():
                 vals = req_tree.item(item, "values")
-                if len(vals) >= 3 and "Нет в медиатеке" in str(vals[2]):
-                    items.append(item)
+                if len(vals) >= 3:
+                    status = str(vals[2]).strip().lower()
+                    # всё, что НЕ начинается с "найдено" — считаем «не найденным»
+                    if not status.startswith("найдено"):
+                        items.append(item)
+
             if not items:
-                messagebox.showinfo("Загрузка",
-                                    "Нет строк со статусом «Нет в медиатеке».")
+                messagebox.showinfo(
+                    "Поиск",
+                    "Нет строк, которые считаются «не найденными»."
+                )
                 return
         else:
             return
 
-        out_dir = out_dir_var.get().strip()
-        if not out_dir:
-            messagebox.showerror("Загрузка",
-                                "Не указана папка сохранения в блоке Kino.pub.")
-            return
+        # 2) Чистим таблицу поиска Kino.pub
+        for row in tree_search.get_children():
+            tree_search.delete(row)
+        search_meta.clear()
+        checked_items.clear()
 
-        added = 0
-        not_found_online = 0
+        used_urls: set[str] = set()
+        fallback_titles: list[str] = []
+        seen_titles: set[str] = set()
 
+        # 3) Переносим строки в kino_search, используя уже сохранённый kino_url.
+        #    Параллельно собираем названия для возможного fallback-поиска.
         for item_id in items:
             meta = request_rows_meta.get(item_id) or {}
 
@@ -1492,70 +1527,80 @@ def main():
             if not original:
                 continue
 
-            title, _ = split_title_year(original)
-            title = title or original
-            if not title:
-                continue
+            url = (meta.get("kino_url") or "").strip()
 
-            url = None
-            display_title = None
-            base_title = None
-            year = None
-            eng_title = None
+            if url:
+                base_title, year = split_title_year(original)
+                base_title = base_title or original
 
-            pre_url = meta.get("kino_url")
-            if pre_url:
-                url = pre_url
-                vals = req_tree.item(item_id, "values")
-                if len(vals) >= 4:
-                    display_title = str(vals[3]) or title
-                else:
-                    display_title = title
+                if url in used_urls:
+                    continue
+                used_urls.add(url)
+
+                display_title = f"{base_title} ({year})" if year else base_title
+
+                row_id = tree_search.insert(
+                    "",
+                    "end",
+                    values=("☐", original, display_title, year or "", url),
+                )
+                search_meta[row_id] = {
+                    "query": original,
+                    "title": base_title,
+                    "year":  year,
+                    "url":   url,
+                    "eng_title": None,
+                }
             else:
-                try:
-                    results = kino_search_real(title, max_results=1)
-                except Exception as e:
-                    logging.error("kino_search_real('%s') failed: %s", title, e)
-                    continue
+                if original not in seen_titles:
+                    seen_titles.add(original)
+                    fallback_titles.append(original)
 
-                if not results:
-                    not_found_online += 1
-                    continue
+        # 4а) Если есть сохранённые URL — ведём себя как раньше
+        if used_urls:
+            slide_switch(requests, kino_search, root, "right")
+            return
 
-                display_title, url, base_title, year, eng_title = results[0]
+        # 4б) Если URL нет, но есть названия — делаем поиск по списку на Kino.pub
+        if fallback_titles:
+            try:
+                list_text.delete("1.0", "end")
+                list_text.insert("1.0", "\n".join(fallback_titles))
+            except Exception:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Не удалось подготовить список для поиска на Kino.pub."
+                )
+                return
 
-            if not url:
-                not_found_online += 1
-                continue
+            # стандартный поиск по списку
+            search_by_list()
+            slide_switch(requests, kino_search, root, "right")
+            return
 
-            shown_title = display_title
-            if eng_title:
-                shown_title = f"{display_title} / {eng_title}"
-
-            row_id = add_row(shown_title, status="🟡 Подготовка...")
-            if hasattr(manager, "url_by_item"):
-                manager.url_by_item[row_id] = url
-
-            manager.start_item(row_id, url, out_dir)
-            added += 1
-
+        # 4в) Вообще ничего нет — показываем старое сообщение
         messagebox.showinfo(
-            "Kino.pub",
-            f"В очередь загрузки добавлено: {added}\n"
-            f"Не найдено на Kino.pub: {not_found_online}"
+            "Поиск",
+            "Для выбранных строк нет сохранённых ссылок Kino.pub.\n"
+            "Обычно они появляются, если список был получен с экрана новинок или поиска Kino.pub."
         )
 
 
+
+
+
     btn_req_check.config(command=check_requests)
-    btn_req_clear.config(command=clear_requests)
+    btn_req_clear.config(command=lambda: clear_requests(True))
     btn_req_txt.config(command=load_requests_from_txt)
     btn_req_copy.config(command=copy_selected_requests)
+
     btn_req_dl_selected.config(
-        command=lambda: download_requests("selected")
+        command=lambda: search_requests("selected")
     )
     btn_req_dl_missing.config(
-        command=lambda: download_requests("missing")
+        command=lambda: search_requests("missing")
     )
+
 
 
         # ========== Kino.pub Tools ==========
@@ -1602,10 +1647,6 @@ def main():
     btn_login_uc.pack(side="right", padx=12)
 
     # карточка загрузчика
-    card_kino = tk.Frame(kino, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
-    card_kino.place(relx=0.5, rely=0.555, anchor="center", width=680, height=640)
-    tk.Frame(card_kino, bg=ACCENT, height=3).pack(fill="x", side="top")
-
     card_kino = tk.Frame(kino, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
     card_kino.place(relx=0.5, rely=0.555, anchor="center", width=680, height=640)
     tk.Frame(card_kino, bg=ACCENT, height=3).pack(fill="x", side="top")
@@ -1691,9 +1732,53 @@ def main():
         tree.set(item, "status", "🟡 Подготовка...")
         out_dir = out_dir_var.get().strip()
         manager.start_item(item, url, out_dir)
+    
 
+    def open_download_dir():
+        out_dir = out_dir_var.get().strip()
+        if not out_dir:
+            return
+        if os.name == "nt":
+            subprocess.Popen(["explorer", out_dir])
+        else:
+            try:
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", out_dir])
+                else:
+                    subprocess.Popen(["xdg-open", out_dir])
+            except Exception:
+                pass
+    def delete_if_waiting():
+        sel = tree.selection()
+        if not sel:
+            return
+
+        for item in sel:
+            status = str(tree.set(item, "status"))
+            # Удаляем только если ещё не идёт загрузка / MUX
+            if "Ожидает" in status or "Подготовка" in status:
+                # Отвязываем служебные структуры, если есть
+                if hasattr(manager, "url_by_item"):
+                    manager.url_by_item.pop(item, None)
+                if hasattr(manager, "threads"):
+                    manager.threads.pop(item, None)
+
+                tree.delete(item)
+
+        # Перенумеровать №
+        reindex_rows()
+                
     context_menu.add_command(label="Повторить / перезапустить загрузку",
                              command=retry_selected)
+    context_menu.add_command(
+        label="Открыть папку загрузки",
+        command=open_download_dir,
+    )
+    context_menu.add_separator()
+    context_menu.add_command(
+        label="Удалить (если ожидает)",
+        command=delete_if_waiting,
+    )
 
     def on_right_click(event):
         item = tree.identify_row(event.y)
@@ -1730,7 +1815,7 @@ def main():
     style.map("Treeview",
               background=[("selected", ACCENT)],
               foreground=[("selected", "white")])
-
+    
     # --- Кнопки управления очередью (скрываем, если флаг False) ---
     if SHOW_QUEUE_CONTROLS:
         controls = tk.Frame(queue_part, bg=BG_SURFACE); controls.pack(fill="x", pady=(6, 2))
@@ -2098,6 +2183,62 @@ def main():
     btn_search_list.pack(side="right", padx=(8, 0))
 
 
+        # --- Опции кодирования (MUX) ---
+    enc_frame = tk.Frame(card_search, bg=BG_SURFACE)
+    enc_frame.pack(fill="x", padx=40, pady=(4, 0))
+
+    # читаем настройки (можно использовать тот же settings, что выше, либо заново)
+    try:
+        enc_settings = load_settings()
+    except Exception:
+        enc_settings = {}
+
+    saved_reencode = enc_settings.get("hls_reencode", True)
+    hls_reencode_var = tk.BooleanVar(value=bool(saved_reencode))
+
+    def _on_hls_reencode_changed(*_):
+        # True → перекодируем (как сейчас);
+        # False → только MUX, без перекодирования.
+        value = bool(hls_reencode_var.get())
+        try:
+            set_hls_reencode(value)
+        except Exception:
+            pass
+
+        # сохраняем в settings.json
+        try:
+            s = load_settings()
+            s["hls_reencode"] = value
+            save_settings(s)
+        except Exception as e:
+            logging.error("Не удалось сохранить настройку hls_reencode: %s", e)
+
+    # при изменении галочки обновляем глобальный флаг и настройки
+    hls_reencode_var.trace_add("write", _on_hls_reencode_changed)
+
+
+    chk_hls_reencode = tk.Checkbutton(
+        enc_frame,
+        text="Перекодировать видео в фиксированный битрейт (NVENC)",
+        variable=hls_reencode_var,
+        onvalue=True,
+        offvalue=False,
+        bg=BG_SURFACE,
+        fg=SUBTEXT,
+        activebackground=BG_SURFACE,
+        activeforeground=SUBTEXT,
+        selectcolor=BG_SURFACE,
+        font=("Segoe UI", 9),
+        anchor="w",
+        highlightthickness=0,
+        bd=0,
+        pady=0,
+    )
+    chk_hls_reencode.pack(anchor="w")
+
+    # синхронизируем стартовое состояние с движком HLS
+    set_hls_reencode(bool(hls_reencode_var.get()))
+
     # --- Новинки ---
     news_frame = tk.Frame(card_search, bg=BG_SURFACE)
     news_frame.pack(fill="x", padx=40, pady=(6, 0))
@@ -2111,6 +2252,8 @@ def main():
     res_scroll = tk.Scrollbar(results_container)
     res_scroll.pack(side="right", fill="y")
 
+
+
     # БЫЛО: res_columns = ("query", "title", "year", "url")
     # СТАЛО: первая колонка — чекбокс
     res_columns = ("chk", "query", "title", "year", "url")
@@ -2118,12 +2261,12 @@ def main():
         results_container,
         columns=res_columns,
         show="headings",
-        height=8,
+        height=7,
         yscrollcommand=res_scroll.set,
     )
     res_scroll.config(command=tree_search.yview)
 
-    tree_search.heading("chk",   text="",        anchor="center")
+    tree_search.heading("chk",   text="☐",       anchor="center")
     tree_search.heading("query", text="Запрос",  anchor="w")
     tree_search.heading("title", text="Название", anchor="w")
     tree_search.heading("year",  text="Год",     anchor="center")
@@ -2139,6 +2282,30 @@ def main():
 
     # --- состояние чекбоксов ---
     checked_items: set[str] = set()
+    header_checked = False  # состояние "выбраны все" для заголовка
+
+    def set_all(checked: bool):
+        """Отметить или снять все галочки в списке."""
+        nonlocal header_checked
+        header_checked = checked
+
+        # обновляем иконку в заголовке
+        tree_search.heading("chk", text="☑" if checked else "☐")
+
+        for item_id in tree_search.get_children():
+            vals = list(tree_search.item(item_id, "values"))
+            if not vals:
+                continue
+
+            if checked:
+                checked_items.add(item_id)
+                vals[0] = "☑"
+            else:
+                checked_items.discard(item_id)
+                vals[0] = "☐"
+
+            tree_search.item(item_id, values=vals)
+
 
     def toggle_check(item_id: str):
         if not item_id:
@@ -2157,12 +2324,22 @@ def main():
         tree_search.item(item_id, values=vals)
 
     def on_tree_click(event):
-        """Клик по первой колонке — переключаем галочку."""
+        """
+        Клик по первой колонке:
+        - по заголовку — отметить/снять все;
+        - по ячейке — переключить галочку у строки.
+        """
         region = tree_search.identify("region", event.x, event.y)
+        col = tree_search.identify_column(event.x)  # "#1", "#2", ...
+
+        # Клик по заголовку первой колонки — "выделить всё"
+        if region == "heading" and col == "#1":
+            set_all(not header_checked)
+            return "break"
+
         if region != "cell":
             return
 
-        col = tree_search.identify_column(event.x)  # "#1", "#2", ...
         row = tree_search.identify_row(event.y)
         if not row:
             return
@@ -2170,6 +2347,7 @@ def main():
         if col == "#1":  # колонка chk
             toggle_check(row)
             return "break"  # не трогаем стандартный selection
+
 
     tree_search.bind("<Button-1>", on_tree_click)
 
@@ -2308,12 +2486,22 @@ def main():
         search_url = f"{KINOPUB_BASE}/item/search?query={q}"
         logging.info(f"[SEARCH] GET {search_url}")
 
-        drv.get(search_url)
+        # Ловим таймауты/глюки рендерера, чтобы не падало всё приложение
+        try:
+            drv.get(search_url)
+        except Exception as e:
+            logging.warning("SEARCH drv.get timeout/error for %r: %s", search_url, e)
+            return []  # ничего не нашли, но GUI жив
 
         try:
             WebDriverWait(drv, 10).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
+        except Exception:
+            logging.warning("Страница поиска долго не загружается для запроса %s", title)
+        except Exception:
+            logging.warning("Страница поиска долго не загружается для запроса %s", title)
+
         except Exception:
             logging.warning("Страница поиска долго не загружается для запроса %s", title)
 
@@ -2510,34 +2698,41 @@ def main():
             if not title:
                 continue
 
-            # Для списка берём только лучший (первый) результат
-            results = kino_search_real(title, max_results=1)
+            # ТЕПЕРЬ: для списка берём НЕ один, а несколько вариантов
+            # можно оставить 50 как в одиночном поиске,
+            # либо поставить 20, если боишься огромных списков
+            results = kino_search_real(title, max_results=50)
             if not results:
                 logging.info("Список: для '%s' ничего не найдено", line)
                 continue
 
-            display_title, url, base_title, y, eng_title = results[0]
+            # добавляем ВСЕ найденные варианты в таблицу
+            for display_title, url, base_title, y, eng_title in results:
+                shown_title = display_title
+                if eng_title:
+                    shown_title = f"{display_title} / {eng_title}"
 
-            shown_title = display_title
-            if eng_title:
-                shown_title = f"{display_title} / {eng_title}"
+                item_id = tree_search.insert(
+                    "",
+                    "end",
+                    values=("☐", original, shown_title, y or "", url),
+                )
+                search_meta[item_id] = {
+                    "query": original,    # что было в списке
+                    "title": base_title,  # базовый рус. тайтл
+                    "year":  y,
+                    "url":   url,
+                    "eng_title": eng_title,
+                }
 
-            item_id = tree_search.insert(
-                "", "end",
-                values=("☐", original, shown_title, y or "", url),
-            )
-            search_meta[item_id] = {
-                "query": original,
-                "title": base_title,
-                "year":  y,
-                "url":   url,
-                "eng_title": eng_title,
-            }
-
-            anything = True
+                anything = True
 
         if not anything:
-            messagebox.showinfo("Поиск", "Список пустой или по нему ничего не найдено.")
+            messagebox.showinfo(
+                "Поиск",
+                "Список пустой или по нему ничего не найдено."
+            )
+
 
 
     def search_from_txt():
@@ -2873,9 +3068,9 @@ def main():
                     "Не удалось собрать названия для запросов."
                 )
                 return
-
+            
             # 2) заливаем список в экран запросов
-            clear_requests()
+            clear_requests(reset_urls=False)    
             req_text.insert("1.0", "\n".join(lines))
 
             # 3) переключаем экран

@@ -215,6 +215,23 @@ def _wait_challenge_solved(driver, timeout: int = 30) -> bool:
 
 FFMPEG_BIN = r"C:\Project\MovieYearFinder\ffmpeg\bin\ffmpeg.exe"
 print("[FFMPEG USED]", FFMPEG_BIN)
+# === Настройки битрейта итогового файла (HLS MUX) ===
+# Общая целевая скорость потока, как в свойствах файла / плеере (кбит/с)
+TARGET_TOTAL_KBPS = 6000        # здесь задаёшь нужный ОБЩИЙ битрейт
+
+# Битрейт аудио (каждой дорожки), тоже в кбит/с
+AUDIO_BITRATE_KBPS = 192
+
+# Минимальный битрейт видео (на случай, если вдруг total < audio)
+MIN_VIDEO_BITRATE_KBPS = 1000
+# Флаг: перекодировать ли видео при MUX (NVENC) или только ремультиплексировать
+ENABLE_REENCODE = True
+
+
+def set_reencode(enabled: bool):
+    """Глобальная настройка: включить/выключить перекодирование при MUX."""
+    global ENABLE_REENCODE
+    ENABLE_REENCODE = bool(enabled)
 
 
 
@@ -1593,8 +1610,18 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None):
                 audio_meta.append((title, lang))
 
         # --- MUX ---
+        
         base, _ = os.path.splitext(out_path)
         tmp_out = base + ".mp4.part"
+
+        # считаем битрейт
+        total_kbps  = TARGET_TOTAL_KBPS
+        audio_kbps  = AUDIO_BITRATE_KBPS if audio_files else 0
+        video_kbps  = max(MIN_VIDEO_BITRATE_KBPS, total_kbps - audio_kbps)
+
+        v_bitrate = f"{video_kbps}k"
+        a_bitrate = f"{audio_kbps}k" if audio_kbps else None
+        v_bufsize = f"{video_kbps * 2}k"
 
         cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", video_file]
 
@@ -1603,10 +1630,42 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None):
         if not audio_files:
             print("⚠️ Нет аудиодорожек, MUX только видео.")
 
+                # Маппинг дорожек
         cmd += ["-map", "0:v:0"]
         for i in range(len(audio_files)):
             cmd += ["-map", f"{i+1}:a:0"]
 
+        if ENABLE_REENCODE:
+            # ВИДЕО — перекод через NVENC с таргет-битрейтами
+            cmd += [
+                "-c:v", "h264_nvenc",
+                "-pix_fmt", "yuv420p",
+                "-preset", "p4",
+                "-profile:v", "high",
+                "-tune", "hq",
+                "-spatial_aq", "1",
+                "-temporal_aq", "1",
+                "-rc", "vbr_hq",
+                "-b:v", v_bitrate,
+                "-maxrate", v_bitrate,
+                "-bufsize", v_bufsize,
+            ]
+
+            # АУДИО — AAC в фиксированный битрейт (чтобы общий bitrate был предсказуем)
+            if audio_files:
+                cmd += ["-c:a", "aac", "-b:a", a_bitrate]
+            else:
+                cmd += ["-an"]
+        else:
+            # Без перекодирования: быстрый ремультиплекс
+            cmd += ["-c:v", "copy"]
+            if audio_files:
+                cmd += ["-c:a", "copy"]
+            else:
+                cmd += ["-an"]
+
+
+        # метаданные по аудио
         for i, (title, lang) in enumerate(audio_meta):
             cmd += ["-metadata:s:a:{0}".format(i), f"title={title}"]
             cmd += ["-metadata:s:a:{0}".format(i), f"language={lang}"]
@@ -1614,16 +1673,28 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None):
         if audio_files:
             cmd += ["-disposition:a:0", "default"]
 
-        cmd += ["-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp_out]
+        cmd += [
+            "-map_metadata", "-1",
+            "-sn",
+            "-movflags", "+faststart",
+            "-f", "mp4",
+            tmp_out,
+        ]
+
 
 
         if status_cb:
             status_cb("🟣 MUX…")
 
         # для отладки: покажем точную команду ffmpeg
+        # показываем точную команду ffmpeg
         cmd_quoted = [f'"{str(c)}"' if " " in str(c) else str(c) for c in cmd]
-        print("🧩 Муксую...")
+        if ENABLE_REENCODE:
+            print("🧩 Муксую (перекодирование NVENC)…")
+        else:
+            print("🧩 Муксую (без перекодирования, copy)…")
         print("MUX CMD:", " ".join(cmd_quoted))
+
 
         rc = _run_ffmpeg(cmd)
         if rc == 0 and os.path.exists(tmp_out):

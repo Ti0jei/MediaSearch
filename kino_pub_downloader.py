@@ -113,8 +113,18 @@ def _extract_display_name(driver, item_url) -> str:
             year = m.group(0) if m else ""
 
         name = f"{title_ru} ({year})" if year else title_ru
-        name = re.sub(r'[\\/:*?"<>|]', "_", name)
+
+        # Запрещённые символы Windows → пробел
+        name = re.sub(r'[\\/:*?"<>|]', " ", name)
+
+        # Схлопываем подряд идущие пробелы
+        name = re.sub(r"\s{2,}", " ", name)
+
+        # Убираем пробелы и точки по краям (Windows не любит такие имена)
+        name = name.strip(" .")
+
         return name or "video"
+
 
     except Exception:
         slug = re.sub(r"[#?].*$", "", item_url).rstrip("/").split("/")[-1]
@@ -184,18 +194,16 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None) -> boo
 
         ok = download_by_item_url(item_url, out_path, driver=use_driver, status_cb=status_cb)
 
-
-        # ВАЖНО:
-        # download_by_item_url() всегда завершает СРАЗУ,
-        # а само скачивание идёт в фоне через start_hls_download()
-        # Поэтому НЕ пишем “Готово!” здесь.
+        # Теперь download_by_item_url() работает СИНХРОННО:
+        # и анализ HLS, и скачивание, и MUX выполняются внутри него.
+        # Здесь просто логируем общий результат.
 
         if not ok:
-            _log(status_cb, "❌ Ошибка при подготовке HLS.")
+            _log(status_cb, "❌ Ошибка при скачивании.")
         else:
-            _log(status_cb, "⏳ Подготовка завершена, началось скачивание...")
-        # ВАЖНО: НИЧЕГО НЕ ВОЗВРАЩАЕМ КАК ГОТОВО!
-        return True
+            _log(status_cb, "✅ Скачивание завершено.")
+        return ok
+
         
 
     except Exception as e:
@@ -215,11 +223,10 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None) -> boo
 # -------------------------------------------------------
 def download_multiple(urls, out_dir, status_cb=None):
     """
-    Простой батч: последовательно берём драйвер из пула → достаём m3u8 → запускаем ffmpeg в отдельных потоках.
+    Простой батч: берём драйвер из пула → достаём m3u8 → синхронно качаем и муксуем.
     """
     os.makedirs(out_dir, exist_ok=True)
     pool = DriverPool(max_drivers=2, status_cb=status_cb)
-    threads = []
     try:
         for url in urls:
             drv = pool.acquire(timeout=10)
@@ -233,17 +240,15 @@ def download_multiple(urls, out_dir, status_cb=None):
                 safe_name = _extract_display_name(drv, url)
                 out_path = os.path.join(out_dir, safe_name + ".mp4")
 
-                t = start_hls_download(video_m3u8, audios, hdrs, out_path, status_cb)
-                threads.append(t)
+                # start_hls_download теперь блокирующий
+                start_hls_download(video_m3u8, audios, hdrs, out_path, status_cb)
 
             finally:
                 pool.release(drv)
 
-        for t in threads:
-            t.join()
-
     finally:
         pool.close_all()
+
 
 
 # =======================================================
@@ -267,11 +272,9 @@ class QueueDownloader:
         self.stop_event = threading.Event()
         self.pool = DriverPool(max_drivers=max(1, concurrency), status_cb=status_cb)
 
-        self._active_ffmpeg_threads: set[threading.Thread] = set()
-        self._ff_lock = threading.Lock()
-
         # поднимаем воркеры
         self.workers: list[threading.Thread] = []
+
         for i in range(max(1, concurrency)):
             t = threading.Thread(target=self._worker, name=f"dl-worker-{i+1}", daemon=True)
             t.start()
@@ -343,15 +346,10 @@ class QueueDownloader:
                     self.pool.release(drv)
                     continue
 
-                # запускаем ffmpeg-поток и больше драйвер не нужен
-                ff_t = start_hls_download(video_m3u8, audios, hdrs, out_path, self.status_cb)
-                with self._ff_lock:
-                    self._active_ffmpeg_threads.add(ff_t)
+                # синхронно качаем и муксуем; драйвер больше не нужен
+                start_hls_download(video_m3u8, audios, hdrs, out_path, self.status_cb)
+                _log(self.status_cb, f"✅ Скачано: {out_path}")
 
-                # отдельный наблюдатель за конкретной загрузкой
-                threading.Thread(
-                    target=self._wait_and_detach, args=(ff_t, out_path), daemon=True
-                ).start()
 
             except Exception as e:
                 _log(self.status_cb, f"❌ Ошибка воркера: {e}")
@@ -362,30 +360,25 @@ class QueueDownloader:
                         self.pool.release(drv)
                 finally:
                     self.q.task_done()
-
-    def _wait_and_detach(self, ff_thread: threading.Thread, out_path: str):
-        try:
-            ff_thread.join()
-            _log(self.status_cb, f"✅ Скачано: {out_path}")
-        finally:
-            with self._ff_lock:
-                self._active_ffmpeg_threads.discard(ff_thread)
-
     def wait_all(self):
-        """Дождаться, когда очередь опустеет и завершатся все текущие ffmpeg-потоки."""
+        """Дождаться, когда очередь опустеет (все воркеры докачают своё)."""
         self.q.join()
-        while True:
-            with self._ff_lock:
-                alive = [t for t in self._active_ffmpeg_threads if t.is_alive()]
-            if not alive:
-                break
-            time.sleep(0.2)
 
     def stop(self):
         """Остановить воркеров и закрыть драйверы после завершения текущих задач."""
         self.stop_event.set()
-        # дождаться очереди и текущих ffmpeg
+        # дождаться обработки всех задач
         self.wait_all()
+
+        # разбудить и аккуратно завершить воркеров
+        for _ in self.workers:
+            self.q.put_nowait("")
+        for t in self.workers:
+            t.join(timeout=1.0)
+
+        # закрыть драйверы пула
+        self.pool.close_all()
+        _log(self.status_cb, "🧹 Очередь остановлена, драйверы закрыты.")
 
         # остановить воркеров
         for _ in self.workers:

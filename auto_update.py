@@ -431,7 +431,7 @@ def _show_prompt(root, latest: dict):
 
 
 # ---- публичная функция ----
-def check_for_updates_async(root, show_if_latest=False):
+def check_for_updates_async(root, show_if_latest=False, notify_cb=None):
     def worker():
         last_err = None
         latest = None
@@ -472,6 +472,17 @@ def check_for_updates_async(root, show_if_latest=False):
                 return
             if _prefs_load().get("skip_version") == latest["version"]:
                 return
+            if notify_cb:
+                try:
+                    root.after(
+                        0,
+                        lambda: notify_cb(
+                            "⬆️ Обновление",
+                            f"Доступна версия {latest['version']}.",
+                        ),
+                    )
+                except Exception:
+                    pass
             root.after(0, lambda: _show_prompt(root, latest))
         except Exception as e:
             print("[update] compare failed:", e)

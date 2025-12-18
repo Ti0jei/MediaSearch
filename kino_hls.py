@@ -18,6 +18,22 @@ else:
 _FFMPEG_LOCK = threading.Lock()  # пока про запас, если захочешь синхронизировать только лог-файлы
 
 
+class DownloadCancelled(Exception):
+    pass
+
+
+def _is_cancelled(cancel_event) -> bool:
+    try:
+        return cancel_event is not None and cancel_event.is_set()
+    except Exception:
+        return False
+
+
+def _raise_if_cancelled(cancel_event) -> None:
+    if _is_cancelled(cancel_event):
+        raise DownloadCancelled()
+
+
 def _origin_from_referer(ref: str) -> str:
     try:
         u = urllib.parse.urlsplit(ref or "")
@@ -58,7 +74,7 @@ def _running_inside_vscode() -> bool:
         or os.environ.get("TERM_PROGRAM") == "vscode"
     )
 
-def _run_ffmpeg(cmd) -> int:
+def _run_ffmpeg(cmd, cancel_event=None) -> int:
     """Безопасный запуск ffmpeg — без окна, лог в уникальный файл, stdin отключён."""
     ffmpeg_bin = cmd[0]
     if not os.path.isfile(ffmpeg_bin):
@@ -87,7 +103,28 @@ def _run_ffmpeg(cmd) -> int:
                 stdin=sp.DEVNULL,
                 creationflags=CREATE_NO_WINDOW,
             )
-        return proc.wait()
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                return rc
+            if _is_cancelled(cancel_event):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=3)
+                    except Exception:
+                        pass
+                return -2
+            time.sleep(0.2)
 
     except Exception as e:
         print(f"⚠️ Ошибка запуска ffmpeg: {e}")
@@ -541,7 +578,7 @@ def kino_query_variants(title: str) -> list[str]:
     return out
 
 
-def _sniff_hls_with_cdp(driver, timeout: int = 25) -> tuple[str | None, dict | None]:
+def _sniff_hls_with_cdp(driver, timeout: int = 25, cancel_event=None) -> tuple[str | None, dict | None]:
     try:
         driver.execute_cdp_cmd("Network.enable", {
             "maxTotalBufferSize": 100_000_000,
@@ -581,6 +618,8 @@ def _sniff_hls_with_cdp(driver, timeout: int = 25) -> tuple[str | None, dict | N
                 pass
 
     while time.time() - t0 < timeout:
+        if _is_cancelled(cancel_event):
+            return None, None
         # perf log
         try:
             logs = driver.get_log("performance")
@@ -670,7 +709,9 @@ def _sniff_hls_with_cdp(driver, timeout: int = 25) -> tuple[str | None, dict | N
     headers = _mk_headers()
     for u in ranked:
         try:
-            txt = _http_get_text(u, headers, driver=driver)
+            if _is_cancelled(cancel_event):
+                return None, None
+            txt = _http_get_text(u, headers, driver=driver, cancel_event=cancel_event)
             lines = txt.splitlines()
             n = sum(1 for ln in lines if ln.startswith("#EXT-X-STREAM-INF"))
             hmax = 0
@@ -680,6 +721,8 @@ def _sniff_hls_with_cdp(driver, timeout: int = 25) -> tuple[str | None, dict | N
                     hmax = max(hmax, int(m.group(1)))
             if (n > best_n) or (n == best_n and hmax > best_h):
                 best_url, best_n, best_h = u, n, hmax
+        except DownloadCancelled:
+            return None, None
         except Exception:
             continue
 
@@ -689,18 +732,21 @@ def _sniff_hls_with_cdp(driver, timeout: int = 25) -> tuple[str | None, dict | N
 
 
 
-def _http_get_text(url: str, headers: dict, *, driver=None) -> str:
+def _http_get_text(url: str, headers: dict, *, driver=None, cancel_event=None) -> str:
     """
     Надёжная загрузка текста плейлиста:
       1) пробуем через JS fetch в браузере (если driver есть);
       2) затем много попыток через urllib с гибким SSL-контекстом и ретраями до 200 OK;
       3) если всё равно не удалось — ещё одна попытка браузером и осмысленная ошибка.
     """
+    _raise_if_cancelled(cancel_event)
+
     # 0) Нормализуем заголовки один раз
     _, hdict = _augment_headers(headers)
 
     # 1) сначала через браузер (если доступен)
     if driver is not None:
+        _raise_if_cancelled(cancel_event)
         t = _http_get_text_via_browser(driver, url, hdict)
         if isinstance(t, str) and t:
             return t
@@ -725,6 +771,7 @@ def _http_get_text(url: str, headers: dict, *, driver=None) -> str:
     req = urllib.request.Request(url, headers=hdict or {})
 
     for attempt in range(1, max_tries + 1):
+        _raise_if_cancelled(cancel_event)
         try:
             with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
                 status = getattr(r, "status", 200)
@@ -742,10 +789,12 @@ def _http_get_text(url: str, headers: dict, *, driver=None) -> str:
             last_err = e
 
         # backoff, но с верхней границей, чтобы не уходить в космос
+        _raise_if_cancelled(cancel_event)
         time.sleep(min(0.3 * attempt, 3.0))
 
     # 3) финальный резерв — ещё одна попытка браузером
     if driver is not None:
+        _raise_if_cancelled(cancel_event)
         t = _http_get_text_via_browser(driver, url, hdict)
         if isinstance(t, str) and t:
             return t
@@ -806,13 +855,14 @@ def _normalize_to_master(m3u8_url: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
-def _select_video_and_audios(driver, master_url: str, headers: dict):
+def _select_video_and_audios(driver, master_url: str, headers: dict, cancel_event=None):
     """
     Возвращает: (video_m3u8, [ {uri,name,lang,default}, ... ])
     Надёжный разбор master с внешними аудио. При отсутствии 1080p пробует
     подняться на верхний master в пределах /hls/.
     """
-    text = _http_get_text(master_url, headers, driver=driver)
+    _raise_if_cancelled(cancel_event)
+    text = _http_get_text(master_url, headers, driver=driver, cancel_event=cancel_event)
     if not text:
         print("❌ Не удалось загрузить master.m3u8")
         return master_url, headers, []
@@ -903,7 +953,9 @@ def _select_video_and_audios(driver, master_url: str, headers: dict):
         if alt != master_url:
             print(f"🔁 Попробуем верхний master: {alt}")
             try:
-                return _select_video_and_audios(driver, alt, headers)
+                return _select_video_and_audios(driver, alt, headers, cancel_event=cancel_event)
+            except DownloadCancelled:
+                raise
             except Exception:
                 pass
 
@@ -1119,7 +1171,7 @@ def search_first_item_url(driver, title_query: str) -> str | None:
             continue
 
 
-def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None) -> bool:
+def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None, cancel_event=None) -> bool:
     """
     Основная функция скачивания: использует существующий driver, не создавая новое окно Chrome.
     """
@@ -1137,12 +1189,13 @@ def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None) -
         print("🔁 Используется уже запущенный driver (из downloader).")
 
     try:
+        _raise_if_cancelled(cancel_event)
         # только если мы сами создали — можно показывать окно
         if drv_created:
             _ensure_shown(drv)
 
         # --- ЕДИНСТВЕННЫЙ вызов, без двойной нагрузки ---
-        video_m3u8, hdrs2, audios = get_hls_info(url, driver=drv)
+        video_m3u8, hdrs2, audios = get_hls_info(url, driver=drv, cancel_event=cancel_event)
 
         if not video_m3u8:
             print("❌ Не удалось получить HLS.")
@@ -1156,14 +1209,24 @@ def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None) -
         else:
             print("🎧 Отдельные аудио не найдены (возможно звук в видеопотоке).")
 
-        start_hls_download(video_m3u8, audios, hdrs2.copy(), out_path, status_cb=status_cb)
-        return True
+        ok = start_hls_download(
+            video_m3u8,
+            audios,
+            hdrs2.copy(),
+            out_path,
+            status_cb=status_cb,
+            cancel_event=cancel_event,
+        )
+        return bool(ok)
+
+    except DownloadCancelled:
+        return False
 
     finally:
         if drv_created:
             from kino_parser import safe_quit
             safe_quit(drv)
-def get_hls_info(url: str, driver=None) -> tuple[str | None, dict | None, list]:
+def get_hls_info(url: str, driver=None, cancel_event=None) -> tuple[str | None, dict | None, list]:
     """
     Возвращает (video_m3u8, headers, audios) для данного item_url.
     Не запускает ffmpeg, просто извлекает ссылки.
@@ -1171,6 +1234,7 @@ def get_hls_info(url: str, driver=None) -> tuple[str | None, dict | None, list]:
     if driver is None:
         raise RuntimeError("get_hls_info() требует активный driver (UC).")
 
+    _raise_if_cancelled(cancel_event)
     driver.get(url)
     _wait_challenge_solved(driver, timeout=25)
     WebDriverWait(driver, 20).until(
@@ -1179,9 +1243,11 @@ def get_hls_info(url: str, driver=None) -> tuple[str | None, dict | None, list]:
 
     _inject_m3u8_sniffer_js(driver)
     _start_playback(driver)
-    time.sleep(2)
+    for _ in range(10):
+        _raise_if_cancelled(cancel_event)
+        time.sleep(0.2)
 
-    master, hdrs = _sniff_hls_with_cdp(driver, timeout=10)
+    master, hdrs = _sniff_hls_with_cdp(driver, timeout=10, cancel_event=cancel_event)
     if master:
         master = _normalize_to_master(master)
         master = master.replace(".mp4master.m3u8", ".mp4/master.m3u8")
@@ -1190,7 +1256,7 @@ def get_hls_info(url: str, driver=None) -> tuple[str | None, dict | None, list]:
         print("❌ Не найден master.m3u8")
         return None, None, []
 
-    video_m3u8, hdrs2, audios = _select_video_and_audios(driver, master, hdrs)
+    video_m3u8, hdrs2, audios = _select_video_and_audios(driver, master, hdrs, cancel_event=cancel_event)
     return video_m3u8, hdrs2, audios
 
 def _type_and_pick(driver, query: str, wanted_title: str, wanted_year: str | None):
@@ -1500,8 +1566,9 @@ import shutil
 # -------------------------------------------------------------------------
 import concurrent.futures
 
-def _http_download(url: str, headers: dict, attempt=1, max_tries=50):
+def _http_download(url: str, headers: dict, attempt=1, max_tries=50, cancel_event=None):
     """Скачивание сегмента с жесткими ретраями до 200 OK."""
+    _raise_if_cancelled(cancel_event)
     _, hdict = _augment_headers(headers)
     import ssl, urllib.error
 
@@ -1516,19 +1583,21 @@ def _http_download(url: str, headers: dict, attempt=1, max_tries=50):
     req = urllib.request.Request(url, headers=hdict)
 
     for i in range(1, max_tries + 1):
+        _raise_if_cancelled(cancel_event)
         try:
             with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
                 if 200 <= r.status < 300:
                     return r.read()
         except Exception:
             pass
+        _raise_if_cancelled(cancel_event)
         time.sleep(min(0.2 * i, 2))
 
     raise RuntimeError(f"SEGMENT FAIL: {url}")
 
 
 def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
-                         status_cb=None, label="Видео", workers=8):
+                         status_cb=None, label="Видео", workers=8, cancel_event=None):
     """
     Скачивает HLS-видео/аудио в mp4, БЕЗ ffmpeg.
     """
@@ -1536,11 +1605,18 @@ def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
     if status_cb:
         status_cb(f"⬇️ {label}")
 
-    text = _http_get_text(m3u8_url, headers)
+    if _is_cancelled(cancel_event):
+        return False
+    try:
+        text = _http_get_text(m3u8_url, headers, cancel_event=cancel_event)
+    except DownloadCancelled:
+        return False
     base = m3u8_url.rsplit("/", 1)[0]
 
     segments = []
     for ln in text.splitlines():
+        if _is_cancelled(cancel_event):
+            return False
         ln = ln.strip()
         if ln and not ln.startswith("#"):
             segments.append(urllib.parse.urljoin(m3u8_url, ln))
@@ -1549,27 +1625,157 @@ def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
         print("❌ Нет сегментов!")
         return False
 
-    # скачиваем параллельно
+    # скачиваем параллельно (с кооперативной отменой)
     data = [None] * len(segments)
-    def load(i, url):
-        data[i] = _http_download(url, headers)
+    total = len(segments)
+    done_cnt = 0
+    last_pct = -1
+    last_ts = 0.0
+    start_ts = time.time()
+    bytes_done = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(load, i, url) for i, url in enumerate(segments)]
-        for f in concurrent.futures.as_completed(futs):
-            pass
+    def _fmt_speed(bps: float) -> str:
+        try:
+            bps = float(bps)
+        except Exception:
+            bps = 0.0
+        if bps >= 1024 * 1024:
+            return f"{bps / (1024 * 1024):.1f}MB/s"
+        if bps >= 1024:
+            return f"{bps / 1024:.0f}KB/s"
+        return f"{bps:.0f}B/s"
+
+    def _fmt_eta(seconds: float | None) -> str:
+        try:
+            if seconds is None:
+                return ""
+            seconds = int(max(0, float(seconds) + 0.5))
+        except Exception:
+            return ""
+        if seconds <= 0:
+            return "00:00"
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        if h > 0:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def load(i, url):
+        chunk = _http_download(url, headers, cancel_event=cancel_event)
+        data[i] = chunk
+        try:
+            return len(chunk)
+        except Exception:
+            return 0
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    pending = set()
+    shutdown_wait = True
+    try:
+        for i, url in enumerate(segments):
+            _raise_if_cancelled(cancel_event)
+            pending.add(ex.submit(load, i, url))
+
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=0.2,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for f in done:
+                try:
+                    bytes_done += int(f.result() or 0)
+                except Exception:
+                    # если исключение в сегменте — пробросится ниже
+                    f.result()
+            done_cnt += len(done)
+            if status_cb and total > 0:
+                try:
+                    pct = int(done_cnt * 100 / total)
+                    pct = max(0, min(100, pct))
+                    now = time.time()
+                    if pct >= 100 or pct - last_pct >= 5 or (now - last_ts) >= 1.2:
+                        last_pct = pct
+                        last_ts = now
+                        speed = ""
+                        eta_txt = ""
+                        try:
+                            elapsed = max(0.25, now - start_ts)
+                            speed = _fmt_speed(bytes_done / elapsed) if bytes_done > 0 else ""
+                            if 0 < done_cnt < total:
+                                eta_txt = _fmt_eta((total - done_cnt) * (elapsed / max(1, done_cnt)))
+                        except Exception:
+                            speed = ""
+                            eta_txt = ""
+                        if speed:
+                            if eta_txt:
+                                status_cb(f"⬇️ {label} {pct}% ({speed}, ETA {eta_txt})")
+                            else:
+                                status_cb(f"⬇️ {label} {pct}% ({speed})")
+                        else:
+                            if eta_txt:
+                                status_cb(f"⬇️ {label} {pct}% (ETA {eta_txt})")
+                            else:
+                                status_cb(f"⬇️ {label} {pct}%")
+                except Exception:
+                    pass
+            _raise_if_cancelled(cancel_event)
+
+    except DownloadCancelled:
+        shutdown_wait = False
+        for f in pending:
+            f.cancel()
+        ex.shutdown(wait=False, cancel_futures=True)
+        return False
+
+    except Exception:
+        shutdown_wait = False
+        for f in pending:
+            f.cancel()
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+
+    finally:
+        if shutdown_wait:
+            ex.shutdown(wait=True)
+
+    try:
+        if status_cb and total > 0 and last_pct < 100:
+            now = time.time()
+            speed = ""
+            try:
+                elapsed = max(0.25, now - start_ts)
+                speed = _fmt_speed(bytes_done / elapsed) if bytes_done > 0 else ""
+            except Exception:
+                speed = ""
+            if speed:
+                status_cb(f"⬇️ {label} 100% ({speed})")
+            else:
+                status_cb(f"⬇️ {label} 100%")
+    except Exception:
+        pass
 
     # сохраняем склейку
     tmp = out_path + ".part"
-    with open(tmp, "wb") as f:
-        for chunk in data:
-            f.write(chunk)
+    try:
+        with open(tmp, "wb") as f:
+            for chunk in data:
+                if _is_cancelled(cancel_event):
+                    return False
+                f.write(chunk)
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
-    os.replace(tmp, out_path)
     print(f"{label} скачано")
     return True
 
-def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None):
+def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None, cancel_event=None):
     """
     Стойкий режим:
     1) Python скачивает VIDEO HLS (без ffmpeg)
@@ -1577,140 +1783,192 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None):
     3) ffmpeg делает только быстрый MUX
     """
 
-    def worker():
+    def worker() -> bool:
         tmp_dir = out_path + ".parts"
         os.makedirs(tmp_dir, exist_ok=True)
+        tmp_out = None
 
-        video_file = os.path.join(tmp_dir, "video.ts")
-        audio_files = []
-        audio_meta = []
+        try:
+            _raise_if_cancelled(cancel_event)
 
-        # --- VIDEO ---
-        print("🎞 Скачиваю видео...")
-        ok = _download_hls_stream(video_m3u8, headers, video_file, status_cb, "Видео")
-        if not ok:
-            if status_cb: status_cb("❌ Ошибка видео")
-            return
+            video_file = os.path.join(tmp_dir, "video.ts")
+            audio_files = []
+            audio_meta = []
 
-        # --- AUDIO ---
-        print("🎧 Скачиваю аудио...")
-        for i, a in enumerate(audios):
-            url = a.get("uri") or a.get("url")
-            title = a.get("name") or f"Audio {i+1}"
-            lang = a.get("lang") or "und"
-            if not url:
-                continue
+            # --- VIDEO ---
+            print("🎞 Скачиваю видео...")
+            ok = _download_hls_stream(
+                video_m3u8,
+                headers,
+                video_file,
+                status_cb,
+                "Видео",
+                cancel_event=cancel_event,
+            )
+            if not ok:
+                if _is_cancelled(cancel_event):
+                    return False
+                if status_cb:
+                    status_cb("❌ Ошибка видео")
+                return False
 
-            apath = os.path.join(tmp_dir, f"audio_{i+1}.aac")
+            _raise_if_cancelled(cancel_event)
 
-            ok = _download_hls_stream(url, headers, apath,
-                                      status_cb, f"Аудио {i+1} ({title})")
-            if ok:
-                audio_files.append(apath)
-                audio_meta.append((title, lang))
+            # --- AUDIO ---
+            print("🎧 Скачиваю аудио...")
+            audios_valid = []
+            try:
+                for a in (audios or []):
+                    try:
+                        url = a.get("uri") or a.get("url")
+                    except Exception:
+                        url = None
+                    if url:
+                        audios_valid.append(a)
+            except Exception:
+                audios_valid = list(audios or [])
 
-        # --- MUX ---
-        
-        base, _ = os.path.splitext(out_path)
-        tmp_out = base + ".mp4.part"
+            total_audio = len(audios_valid)
+            for idx, a in enumerate(audios_valid, start=1):
+                _raise_if_cancelled(cancel_event)
+                url = a.get("uri") or a.get("url")
+                title = a.get("name") or f"Audio {idx}"
+                lang = a.get("lang") or "und"
+                if not url:
+                    continue
 
-        # считаем битрейт
-        total_kbps  = TARGET_TOTAL_KBPS
-        audio_kbps  = AUDIO_BITRATE_KBPS if audio_files else 0
-        video_kbps  = max(MIN_VIDEO_BITRATE_KBPS, total_kbps - audio_kbps)
+                apath = os.path.join(tmp_dir, f"audio_{idx}.aac")
 
-        v_bitrate = f"{video_kbps}k"
-        a_bitrate = f"{audio_kbps}k" if audio_kbps else None
-        v_bufsize = f"{video_kbps * 2}k"
+                label = f"Аудио {idx}/{max(1, total_audio)}"
+                if title:
+                    label += f" ({title})"
 
-        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", video_file]
+                ok = _download_hls_stream(
+                    url,
+                    headers,
+                    apath,
+                    status_cb,
+                    label,
+                    cancel_event=cancel_event,
+                )
+                if ok:
+                    audio_files.append(apath)
+                    audio_meta.append((title, lang))
+                elif _is_cancelled(cancel_event):
+                    return False
 
-        for ap in audio_files:
-            cmd += ["-i", ap]
-        if not audio_files:
-            print("⚠️ Нет аудиодорожек, MUX только видео.")
+            _raise_if_cancelled(cancel_event)
 
-                # Маппинг дорожек
-        cmd += ["-map", "0:v:0"]
-        for i in range(len(audio_files)):
-            cmd += ["-map", f"{i+1}:a:0"]
+            # --- MUX ---
+            base, _ = os.path.splitext(out_path)
+            tmp_out = base + ".mp4.part"
 
-        if ENABLE_REENCODE:
-            # ВИДЕО — перекод через NVENC с таргет-битрейтами
+            # считаем битрейт
+            total_kbps  = TARGET_TOTAL_KBPS
+            audio_kbps  = AUDIO_BITRATE_KBPS if audio_files else 0
+            video_kbps  = max(MIN_VIDEO_BITRATE_KBPS, total_kbps - audio_kbps)
+
+            v_bitrate = f"{video_kbps}k"
+            a_bitrate = f"{audio_kbps}k" if audio_kbps else None
+            v_bufsize = f"{video_kbps * 2}k"
+
+            cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", video_file]
+
+            for ap in audio_files:
+                cmd += ["-i", ap]
+            if not audio_files:
+                print("⚠️ Нет аудиодорожек, MUX только видео.")
+
+            # Маппинг дорожек
+            cmd += ["-map", "0:v:0"]
+            for i in range(len(audio_files)):
+                cmd += ["-map", f"{i+1}:a:0"]
+
+            if ENABLE_REENCODE:
+                # ВИДЕО — перекод через NVENC с таргет-битрейтами
+                cmd += [
+                    "-c:v", "h264_nvenc",
+                    "-pix_fmt", "yuv420p",
+                    "-preset", "p4",
+                    "-profile:v", "high",
+                    "-tune", "hq",
+                    "-spatial_aq", "1",
+                    "-temporal_aq", "1",
+                    "-rc", "vbr_hq",
+                    "-b:v", v_bitrate,
+                    "-maxrate", v_bitrate,
+                    "-bufsize", v_bufsize,
+                ]
+
+                # АУДИО — AAC в фиксированный битрейт (чтобы общий bitrate был предсказуем)
+                if audio_files:
+                    cmd += ["-c:a", "aac", "-b:a", a_bitrate]
+                else:
+                    cmd += ["-an"]
+            else:
+                # Без перекодирования: быстрый ремультиплекс
+                cmd += ["-c:v", "copy"]
+                if audio_files:
+                    cmd += ["-c:a", "copy"]
+                else:
+                    cmd += ["-an"]
+
+            # метаданные по аудио
+            for i, (title, lang) in enumerate(audio_meta):
+                cmd += ["-metadata:s:a:{0}".format(i), f"title={title}"]
+                cmd += ["-metadata:s:a:{0}".format(i), f"language={lang}"]
+
+            if audio_files:
+                cmd += ["-disposition:a:0", "default"]
+
             cmd += [
-                "-c:v", "h264_nvenc",
-                "-pix_fmt", "yuv420p",
-                "-preset", "p4",
-                "-profile:v", "high",
-                "-tune", "hq",
-                "-spatial_aq", "1",
-                "-temporal_aq", "1",
-                "-rc", "vbr_hq",
-                "-b:v", v_bitrate,
-                "-maxrate", v_bitrate,
-                "-bufsize", v_bufsize,
+                "-map_metadata", "-1",
+                "-sn",
+                "-movflags", "+faststart",
+                "-f", "mp4",
+                tmp_out,
             ]
 
-            # АУДИО — AAC в фиксированный битрейт (чтобы общий bitrate был предсказуем)
-            if audio_files:
-                cmd += ["-c:a", "aac", "-b:a", a_bitrate]
-            else:
-                cmd += ["-an"]
-        else:
-            # Без перекодирования: быстрый ремультиплекс
-            cmd += ["-c:v", "copy"]
-            if audio_files:
-                cmd += ["-c:a", "copy"]
-            else:
-                cmd += ["-an"]
-
-
-        # метаданные по аудио
-        for i, (title, lang) in enumerate(audio_meta):
-            cmd += ["-metadata:s:a:{0}".format(i), f"title={title}"]
-            cmd += ["-metadata:s:a:{0}".format(i), f"language={lang}"]
-
-        if audio_files:
-            cmd += ["-disposition:a:0", "default"]
-
-        cmd += [
-            "-map_metadata", "-1",
-            "-sn",
-            "-movflags", "+faststart",
-            "-f", "mp4",
-            tmp_out,
-        ]
-
-
-
-        if status_cb:
-            status_cb("🟣 MUX…")
-
-        # для отладки: покажем точную команду ffmpeg
-        # показываем точную команду ffmpeg
-        cmd_quoted = [f'"{str(c)}"' if " " in str(c) else str(c) for c in cmd]
-        if ENABLE_REENCODE:
-            print("🧩 Муксую (перекодирование NVENC)…")
-        else:
-            print("🧩 Муксую (без перекодирования, copy)…")
-        print("MUX CMD:", " ".join(cmd_quoted))
-
-
-        rc = _run_ffmpeg(cmd)
-        if rc == 0 and os.path.exists(tmp_out):
-            os.replace(tmp_out, out_path)
-            print("✅ Готово!", out_path)
             if status_cb:
-                status_cb(f"✅ {os.path.basename(out_path)}")
-        else:
+                status_cb("🟣 MUX…")
+
+            # показываем точную команду ffmpeg
+            cmd_quoted = [f'"{str(c)}"' if " " in str(c) else str(c) for c in cmd]
+            if ENABLE_REENCODE:
+                print("🧩 Муксую (перекодирование NVENC)…")
+            else:
+                print("🧩 Муксую (без перекодирования, copy)…")
+            print("MUX CMD:", " ".join(cmd_quoted))
+
+            _raise_if_cancelled(cancel_event)
+            rc = _run_ffmpeg(cmd, cancel_event=cancel_event)
+            if _is_cancelled(cancel_event):
+                return False
+
+            if rc == 0 and os.path.exists(tmp_out):
+                os.replace(tmp_out, out_path)
+                print("✅ Готово!", out_path)
+                if status_cb:
+                    status_cb(f"✅ {os.path.basename(out_path)}")
+                return True
+
             print(f"❌ Ошибка MUX (rc={rc})")
             if status_cb:
                 status_cb(f"❌ Ошибка MUX (код {rc})")
+            return False
 
+        except DownloadCancelled:
+            return False
 
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        finally:
+            if tmp_out and os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except Exception:
+                    pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    worker() 
+    return worker()
 
 
 

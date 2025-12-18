@@ -45,7 +45,10 @@ def _log(status_cb: Optional[Callable[[str], None]], msg: str):
 # -------------------------------------------------------
 # Поиск по названию на сайте
 # -------------------------------------------------------
-def search_titles(query: str, limit=1, status_cb=None, driver=None) -> List[Tuple[str, str]]:
+def search_titles(query: str, limit=1, status_cb=None, driver=None, cancel_event=None) -> List[Tuple[str, str]]:
+    # кооперативная отмена (если поддерживается вызывающим кодом)
+    if getattr(cancel_event, "is_set", lambda: False)():
+        return []
     if driver is None:
         raise RuntimeError("search_titles ожидает активный driver")
 
@@ -80,13 +83,17 @@ def search_titles(query: str, limit=1, status_cb=None, driver=None) -> List[Tupl
 # -------------------------------------------------------
 # Извлечение “красивого” имени файла
 # -------------------------------------------------------
-def _extract_display_name(driver, item_url) -> str:
+def _extract_display_name(driver, item_url, cancel_event=None) -> str:
     """Возвращает 'Русское название (YYYY)' с чисткой служебных символов."""
     try:
+        if getattr(cancel_event, "is_set", lambda: False)():
+            return "video"
         driver.get(item_url)
         WebDriverWait(driver, 25).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "meta[property='og:title'], h1, .item-title"))
         )
+        if getattr(cancel_event, "is_set", lambda: False)():
+            return "video"
         html = driver.page_source
         soup = BeautifulSoup(html, "html.parser")
 
@@ -134,7 +141,7 @@ def _extract_display_name(driver, item_url) -> str:
 # -------------------------------------------------------
 # ОДНО скачивание (с возможностью передать внешний driver из пула)
 # -------------------------------------------------------
-def download(query_or_url: str, out_dir=".", status_cb=None, driver=None) -> bool:
+def download(query_or_url: str, out_dir=".", status_cb=None, driver=None, cancel_event=None) -> bool:
     """
     Скачивание одного фильма.
     Если driver передан (из DriverPool) — используем его, иначе сами поднимем скрытый UC.
@@ -166,9 +173,18 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None) -> boo
 
         # ======= ДАЛЬШЕ ИСПОЛЬЗУЕМ use_driver =======
 
+        if getattr(cancel_event, "is_set", lambda: False)():
+            return False
+
         # URL или поиск
         if not query_or_url.startswith("http"):
-            results = search_titles(query_or_url, limit=1, status_cb=status_cb, driver=use_driver)
+            results = search_titles(
+                query_or_url,
+                limit=1,
+                status_cb=status_cb,
+                driver=use_driver,
+                cancel_event=cancel_event,
+            )
             if not results:
                 _log(status_cb, "❌ Ничего не найдено.")
                 return False
@@ -176,8 +192,11 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None) -> boo
         else:
             item_url = query_or_url
 
+        if getattr(cancel_event, "is_set", lambda: False)():
+            return False
+
         _log(status_cb, "📋 Извлекаю название...")
-        display_name = _extract_display_name(use_driver, item_url)
+        display_name = _extract_display_name(use_driver, item_url, cancel_event=cancel_event)
 
         # --- НОРМАЛИЗАЦИЯ имени ---
         # убираем готовое расширение, если вдруг есть
@@ -189,10 +208,28 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None) -> boo
 
         _log(status_cb, f"🎬 Файл: {os.path.basename(out_path)}")
 
+        # Если файл уже существует — не качаем повторно (стабильность очереди после перезапуска).
+        # Пользователь всегда может удалить файл вручную и запустить снова.
+        try:
+            if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                _log(status_cb, "✅ Уже скачано (файл существует)")
+                return True
+        except Exception:
+            pass
+
         # --- здесь только запуск подготовки ---
         _log(status_cb, "🎬 Подготовка… (анализ HLS)")
 
-        ok = download_by_item_url(item_url, out_path, driver=use_driver, status_cb=status_cb)
+        ok = download_by_item_url(
+            item_url,
+            out_path,
+            driver=use_driver,
+            status_cb=status_cb,
+            cancel_event=cancel_event,
+        )
+
+        if getattr(cancel_event, "is_set", lambda: False)():
+            return False
 
         # Теперь download_by_item_url() работает СИНХРОННО:
         # и анализ HLS, и скачивание, и MUX выполняются внутри него.

@@ -351,10 +351,9 @@ def _safe_get_driver(status_cb=None, headless: bool = False, suppress: bool = Tr
         exe_ref = (str(_CHROMIUM_EXE or "")).replace("\\", "/").lower()
         prof_ref = str(profile_dir).replace("\\", "/").lower()
 
-        def _match(exe_path: str, cmdline_list):
-            ex = (exe_path or "").replace("\\", "/").lower()
-            if ex == exe_ref:
-                return True
+        def _match(_exe_path: str, cmdline_list):
+            # ВАЖНО: не матчим по exe_ref, иначе "suppress" начинает прятать *любые* окна portable-Chromium,
+            # включая те, что мы специально открываем (например, для ручного прохождения Cloudflare).
             cl = " ".join(cmdline_list or []).replace("\\", "/").lower()
             return f"--user-data-dir={prof_ref}" in cl
 
@@ -363,8 +362,9 @@ def _safe_get_driver(status_cb=None, headless: bool = False, suppress: bool = Tr
             parent = psutil.Process(chromedriver_pid)
             for ch in parent.children(recursive=True):
                 try:
-                    if _match(ch.exe(), ch.cmdline()):
-                        s.add(ch.pid)
+                    # Дочерние процессы chromedriver = процессы текущей сессии.
+                    # Добавляем все PID'ы, чтобы reliably скрывать окно даже если cmdline недоступен.
+                    s.add(ch.pid)
                 except Exception:
                     pass
         except Exception:
@@ -753,16 +753,19 @@ def login_to_kino(status_cb=None):
 
         # Ждём успешного логина / CF
         t0 = time.time()
-        # Ждём успешного логина / CF
-        t0 = time.time()
+        last_prompt = 0.0
         while time.time() - t0 < 300:
             url = driver.current_url.lower()
             print(f"[🔍] Текущий URL: {url}")
 
-            # 👉 если страница логина — дать 45 секунд на ручной ввод
+            # 👉 если страница логина — ждём, но не "спим" по 45 сек,
+            # чтобы UI реагировал сразу после успешного входа.
             if "/user/login" in url:
-                _log(status_cb, "⏳ Ожидание 45 секунд — введите логин/пароль...")
-                time.sleep(45)
+                now = time.time()
+                if now - last_prompt > 8:
+                    _log(status_cb, "⏳ Ожидание — введите логин/пароль в браузере…")
+                    last_prompt = now
+                time.sleep(0.5)
                 continue
 
             # 👉 если вошли и редирект прошёл
@@ -772,7 +775,7 @@ def login_to_kino(status_cb=None):
                 messagebox.showinfo("Kino.pub", "Вход успешно выполнен!")
                 return True
 
-            time.sleep(2)
+            time.sleep(1)
 
 
         messagebox.showwarning("Kino.pub", "Не удалось подтвердить вход (таймаут).")
@@ -809,6 +812,33 @@ class DriverPool:
         except Exception:
             setattr(drv, "_kino_cookies_loaded", False)
         return drv
+
+    def warm_up(self, count: int | None = None):
+        """
+        Прогревает пул заранее, чтобы первая загрузка не ждала создание Chromium.
+        """
+        try:
+            target = self.max_drivers if count is None else int(count)
+        except Exception:
+            target = self.max_drivers
+
+        target = max(0, min(int(self.max_drivers), int(target)))
+        while self._total < target:
+            drv = self._new_driver()
+            self._total += 1
+            try:
+                self.q.put_nowait(drv)
+            except Exception:
+                try:
+                    self.q.put(drv)
+                except Exception:
+                    pass
+
+    def warm_up_async(self, count: int | None = None):
+        try:
+            threading.Thread(target=lambda: self.warm_up(count), daemon=True).start()
+        except Exception:
+            pass
 
 
 
@@ -873,4 +903,3 @@ def download_multiple(urls, out_dir, status_cb=None):
     # 🧷 Блокируем завершение до конца всех потоков
     for t in threads:
         t.join()
-

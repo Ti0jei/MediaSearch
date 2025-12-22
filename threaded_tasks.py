@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -15,7 +16,13 @@ def show_loading(root, title, message):
     win.resizable(False, False)
 
     try:
-        win.iconbitmap("icon.ico")
+        if getattr(sys, "frozen", False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(__file__)
+        icon_path = os.path.join(base_dir, "icon.ico")
+        if os.path.exists(icon_path):
+            win.iconbitmap(icon_path)
     except Exception:
         pass
 

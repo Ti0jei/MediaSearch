@@ -43,6 +43,525 @@ def _log(status_cb: Optional[Callable[[str], None]], msg: str):
 
 
 # -------------------------------------------------------
+# Сериал: сезоны/эпизоды
+# -------------------------------------------------------
+def parse_series_episodes(
+    series_url: str,
+    *,
+    driver,
+    status_cb=None,
+    cancel_event=None,
+) -> dict:
+    """
+    Анализирует страницу сериала и возвращает:
+      {
+        "title": "<название сериала>",
+        "seasons": {
+           1: [{"episode": 1, "url": "https://..."}, ...],
+           2: [...]
+        }
+      }
+
+    Важно: структура/селекторы на kino.pub могут меняться, поэтому тут несколько fallback-стратегий.
+    """
+    if driver is None:
+        raise RuntimeError("parse_series_episodes() требует активный driver (UC).")
+
+    from urllib.parse import urljoin, urlsplit, urlunsplit, urlencode, parse_qsl
+
+    def _cancelled() -> bool:
+        return bool(getattr(cancel_event, "is_set", lambda: False)())
+
+    def _ensure_abs(u: str) -> str:
+        u = (u or "").strip()
+        if not u:
+            return ""
+        if u.startswith("http"):
+            return u
+        return urljoin(KINOPUB_BASE + "/", u)
+
+    def _series_episode_url(base: str, season: int, episode: int) -> str:
+        base = _ensure_abs(base)
+        parts = list(urlsplit(base))
+        q = dict(parse_qsl(parts[3], keep_blank_values=True))
+        q["season"] = str(season)
+        q["episode"] = str(episode)
+        parts[3] = urlencode(q)
+        parts[4] = ""  # fragment
+        return urlunsplit(parts)
+
+    def _ensure_cf_solved() -> bool:
+        try:
+            from kino_hls import (
+                _has_challenge,
+                _driver_is_suppressed,
+                _wait_challenge_solved,
+                _solve_cloudflare_in_visible_browser,
+            )
+        except Exception:
+            return True
+
+        try:
+            if not _has_challenge(driver):
+                return True
+        except Exception:
+            return True
+
+        _log(status_cb, "🧩 Обнаружена защита (Cloudflare) — решите в открытом браузере…")
+
+        try:
+            if not _driver_is_suppressed(driver):
+                _wait_challenge_solved(driver, timeout=90)
+                return not _has_challenge(driver)
+        except Exception:
+            pass
+
+        # suppress-драйвер не показать: пробуем подгрузить cookies/refresh
+        try:
+            load_cookies(driver)
+            driver.refresh()
+        except Exception:
+            pass
+
+        try:
+            if not _has_challenge(driver):
+                return True
+        except Exception:
+            return True
+
+        ok = False
+        try:
+            ok = _solve_cloudflare_in_visible_browser(series_url, status_cb=status_cb, timeout=180)
+        except Exception:
+            ok = False
+        if not ok:
+            return False
+
+        try:
+            load_cookies(driver)
+            driver.refresh()
+        except Exception:
+            pass
+
+        try:
+            return not _has_challenge(driver)
+        except Exception:
+            return True
+
+    def _extract_title(html: str) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+        title = ""
+
+        # 1) стараемся взять именно «русский» заголовок из H1/видимого title
+        try:
+            h = soup.select_one("h1, .item-title, .page-title, h2, h3")
+            if h:
+                parts = []
+                try:
+                    parts = [s for s in list(h.stripped_strings) if s]
+                except Exception:
+                    parts = []
+                if parts:
+                    title = str(parts[0]).strip()
+                else:
+                    title = h.get_text(" ", strip=True)
+        except Exception:
+            title = ""
+
+        # 2) fallback: og:title
+        if not title:
+            try:
+                meta = soup.select_one("meta[property='og:title']")
+                if meta and meta.get("content"):
+                    title = str(meta.get("content") or "").strip()
+            except Exception:
+                title = ""
+
+        title = (title or "").strip()
+
+        # убираем хвосты типа "— Kino.pub"
+        try:
+            title = re.sub(r"\s*[—-]\s*Kino\.pub.*$", "", title, flags=re.I).strip()
+        except Exception:
+            pass
+
+        # убираем год в конце, если есть
+        try:
+            title = re.sub(r"\s+\(\d{4}\)\s*$", "", title).strip()
+        except Exception:
+            pass
+
+        # если в заголовке есть «RU / EN» — берём левую часть (RU)
+        try:
+            if "/" in title:
+                left = title.split("/", 1)[0].strip()
+                if left:
+                    title = left
+        except Exception:
+            pass
+
+        # если есть RU + EN без разделителя (например: "Пацаны The Boys") —
+        # убираем англ. хвост, но только если реально есть >=2 латинских слова (чтобы не ломать названия типа "Мистер Robot").
+        try:
+            has_cyr = bool(re.search(r"[А-Яа-яЁё]", title))
+            latin_words = re.findall(r"[A-Za-z]{2,}", title)
+            if has_cyr:
+                # "Пацаны (The Boys)" -> "Пацаны"
+                m = re.match(r"^(.+?)\s*\([^)]*[A-Za-z][^)]*\)\s*$", title)
+                if m:
+                    left = (m.group(1) or "").strip()
+                    if left:
+                        title = left
+
+                # "Пацаны — The Boys" -> "Пацаны"
+                m = re.match(r"^(.+?)\s*[—-]\s*[A-Za-z].*$", title)
+                if m:
+                    left = (m.group(1) or "").strip()
+                    if left:
+                        title = left
+
+            if has_cyr and len(latin_words) >= 2:
+                m = re.match(r"^(.+?)\s+[A-Za-z].*$", title)
+                if m:
+                    title = (m.group(1) or "").strip()
+        except Exception:
+            pass
+
+        return _normalize_display_name(title) if title else "series"
+
+    def _parse_seasons_from_html(html: str) -> list[int]:
+        soup = BeautifulSoup(html, "html.parser")
+        nums: list[int] = []
+        # типовой блок: "Сезоны:" + span.p-r-sm.p-t-sm
+        for el in soup.select("span.p-r-sm.p-t-sm, a.p-r-sm.p-t-sm, button.p-r-sm.p-t-sm"):
+            try:
+                t = el.get_text(" ", strip=True)
+            except Exception:
+                t = ""
+            t = (t or "").strip()
+            if not t.isdigit():
+                continue
+            try:
+                n = int(t)
+            except Exception:
+                continue
+            if 1 <= n <= 99:
+                nums.append(n)
+        nums = sorted({n for n in nums})
+        return nums
+
+    def _find_season_elements() -> dict[int, object]:
+        # Selenium элементы, по которым можно кликать
+        try:
+            from selenium.webdriver.common.by import By
+        except Exception:
+            return {}
+        mapping: dict[int, object] = {}
+        try:
+            elems = driver.find_elements(By.CSS_SELECTOR, "span.p-r-sm.p-t-sm, a.p-r-sm.p-t-sm, button.p-r-sm.p-t-sm")
+        except Exception:
+            elems = []
+        for el in elems or []:
+            try:
+                t = str(el.text or "").strip()
+            except Exception:
+                t = ""
+            if not t.isdigit():
+                continue
+            try:
+                n = int(t)
+            except Exception:
+                continue
+            if 1 <= n <= 99 and n not in mapping:
+                mapping[n] = el
+        return mapping
+
+    def _extract_episodes_from_html(html: str) -> list[tuple[int | None, str | None]]:
+        soup = BeautifulSoup(html, "html.parser")
+        out: list[tuple[int | None, str | None]] = []
+
+        # основной контейнер эпизодов (по скрину: div.row.m-b)
+        cards = soup.select("div.row.m-b .owl-item")
+        if not cards:
+            # fallback: просто все owl-item на странице
+            cards = soup.select(".owl-item")
+
+        for card in cards:
+            href = None
+            try:
+                a = card.select_one("a[href]")
+                if a:
+                    href = a.get("href")
+            except Exception:
+                href = None
+            if not href:
+                try:
+                    href = card.get("data-href") or card.get("data-url")
+                except Exception:
+                    href = None
+
+            if href:
+                href = _ensure_abs(str(href))
+
+            ep_num = None
+            try:
+                text = card.get_text(" ", strip=True)
+            except Exception:
+                text = ""
+            text = (text or "").strip()
+            if text:
+                m = re.search(r"(?:Эпизод|Episode)\s*(\d{1,3})\b", text, re.I)
+                if m:
+                    try:
+                        ep_num = int(m.group(1))
+                    except Exception:
+                        ep_num = None
+
+            # фильтруем явно «не эпизоды»: если нет номера и нет ссылки — пропускаем
+            if ep_num is None and not href:
+                continue
+
+            out.append((ep_num, href))
+
+        # fallback: ссылки в блоке эпизодов
+        if not out:
+            for a in soup.select("div.row.m-b a[href*='/item/'], div.row.m-b a[href]"):
+                try:
+                    href = a.get("href")
+                except Exception:
+                    href = None
+                if not href:
+                    continue
+                href = _ensure_abs(str(href))
+                text = ""
+                try:
+                    text = (a.get_text(" ", strip=True) or "").strip()
+                except Exception:
+                    text = ""
+                ep_num = None
+                m = re.search(r"(?:Эпизод|Episode)\s*(\d{1,3})\b", text, re.I)
+                if m:
+                    try:
+                        ep_num = int(m.group(1))
+                    except Exception:
+                        ep_num = None
+                out.append((ep_num, href))
+
+        return out
+
+    def _collect_episodes_interactive(base_url: str) -> list[dict]:
+        """
+        Пытаемся собрать все эпизоды текущего сезона:
+        - 1 раз парсим HTML целиком
+        - если есть dots (owl-dot) — кликаем каждый и добираем
+        - если есть next-стрелка — кликаем пока появляются новые ссылки
+        """
+        try:
+            from selenium.webdriver.common.by import By
+        except Exception:
+            By = None
+
+        seen: dict[str, int | None] = {}  # url -> ep_num
+
+        def _merge(entries: list[tuple[int | None, str | None]]):
+            for ep_num, href in entries:
+                if not href:
+                    continue
+                if href not in seen:
+                    seen[href] = ep_num
+                else:
+                    # если раньше номер не распарсили, а сейчас распарсили — обновим
+                    if seen[href] is None and ep_num is not None:
+                        seen[href] = ep_num
+
+        # текущий HTML
+        try:
+            _merge(_extract_episodes_from_html(driver.page_source))
+        except Exception:
+            pass
+
+        if not By:
+            # без Selenium селекторов больше ничего не сделаем
+            pass
+        else:
+            # dots
+            try:
+                dots = driver.find_elements(By.CSS_SELECTOR, "div.row.m-b .owl-dots button, div.row.m-b .owl-dots .owl-dot")
+            except Exception:
+                dots = []
+            if dots and len(dots) > 1:
+                for i, dot in enumerate(dots):
+                    if _cancelled():
+                        break
+                    try:
+                        driver.execute_script("arguments[0].click();", dot)
+                        time.sleep(0.35)
+                        _merge(_extract_episodes_from_html(driver.page_source))
+                    except Exception:
+                        continue
+
+            # next-стрелка
+            try:
+                next_btns = driver.find_elements(By.CSS_SELECTOR, "div.row.m-b .owl-nav .owl-next, div.row.m-b .owl-next")
+            except Exception:
+                next_btns = []
+            next_btn = next_btns[0] if next_btns else None
+            if next_btn is not None:
+                stagnation = 0
+                for _ in range(40):
+                    if _cancelled():
+                        break
+                    before = len(seen)
+                    try:
+                        driver.execute_script("arguments[0].click();", next_btn)
+                    except Exception:
+                        break
+                    time.sleep(0.35)
+                    try:
+                        _merge(_extract_episodes_from_html(driver.page_source))
+                    except Exception:
+                        pass
+                    if len(seen) <= before:
+                        stagnation += 1
+                        if stagnation >= 3:
+                            break
+                    else:
+                        stagnation = 0
+
+        # нормализуем: если для части ссылок не нашли номер — раздадим по порядку
+        ordered_urls = list(seen.keys())
+        # приоритет: те, у кого номер известен
+        numbered = [(u, n) for u, n in seen.items() if n is not None]
+        if numbered:
+            # сортируем по номеру, затем остаток
+            numbered.sort(key=lambda x: int(x[1] or 0))
+            ordered_urls = [u for u, _ in numbered] + [u for u in ordered_urls if seen.get(u) is None]
+
+        items: list[dict] = []
+        next_auto = 1
+        for u in ordered_urls:
+            ep = seen.get(u)
+            if ep is None:
+                ep = next_auto
+                next_auto += 1
+            items.append({"episode": int(ep), "url": u})
+        return items
+
+    series_url = _ensure_abs(series_url)
+    if not series_url:
+        raise RuntimeError("Пустая ссылка на сериал.")
+
+    if _cancelled():
+        return {"title": "series", "seasons": {}}
+
+    _log(status_cb, f"📺 Анализ сериала: {series_url}")
+    driver.get(series_url)
+
+    if not _ensure_cf_solved():
+        raise RuntimeError("Cloudflare не пройден (таймаут).")
+
+    try:
+        WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
+    except Exception:
+        pass
+
+    try:
+        if "/user/login" in (driver.current_url or "").lower():
+            raise RuntimeError("Требуется вход в Kino.pub")
+    except Exception:
+        pass
+
+    html0 = driver.page_source
+    title = _extract_title(html0)
+    seasons = _parse_seasons_from_html(html0)
+    season_elems = _find_season_elements()
+    if not seasons:
+        seasons = sorted(season_elems.keys()) if season_elems else [1]
+
+    result: dict = {"title": title, "seasons": {}}
+
+    # если сезоны не находятся/не кликаются — просто соберём «как есть» в сезон 1
+    if not season_elems or len(seasons) <= 1:
+        s_num = int(seasons[0] if seasons else 1)
+        eps = _collect_episodes_interactive(series_url)
+        # Важно: даже если сайт не меняет URL при выборе эпизода, делаем
+        # стабильные ссылки через query params season/episode, чтобы:
+        # - не было дублей между сезонами
+        # - можно было скачать конкретный SxxExx
+        try:
+            for e in eps or []:
+                try:
+                    ep = int((e or {}).get("episode") or 1)
+                except Exception:
+                    ep = 1
+                base = (e or {}).get("url") or series_url
+                e["url"] = _series_episode_url(str(base), s_num, ep)
+        except Exception:
+            pass
+
+        result["seasons"][s_num] = eps
+        # если ссылки не нашлись — попробуем сгенерировать по шаблону
+        if not result["seasons"].get(s_num):
+            # fallback: хотя бы 1 эпизод по базовой ссылке
+            result["seasons"][s_num] = [{"episode": 1, "url": _series_episode_url(series_url, s_num, 1)}]
+        return result
+
+    # полноценный проход по сезонам
+    for s_num in seasons:
+        if _cancelled():
+            break
+        _log(status_cb, f"📺 Сезон {s_num}…")
+        el = season_elems.get(int(s_num))
+        if el is not None:
+            try:
+                driver.execute_script("arguments[0].click();", el)
+            except Exception:
+                try:
+                    el.click()
+                except Exception:
+                    pass
+            time.sleep(0.6)
+
+        eps = _collect_episodes_interactive(series_url)
+        # если не нашлись явные ссылки — сгенерируем по шаблону season/episode
+        if not eps:
+            eps = [{"episode": 1, "url": _series_episode_url(series_url, int(s_num), 1)}]
+        else:
+            # Важно: даже если сайт не меняет URL при выборе эпизода, делаем
+            # стабильные ссылки через query params season/episode, чтобы не было дублей между сезонами.
+            for e in eps:
+                try:
+                    ep = int((e or {}).get("episode") or 1)
+                except Exception:
+                    ep = 1
+                try:
+                    base = (e or {}).get("url") or series_url
+                    e["url"] = _series_episode_url(str(base), int(s_num), ep)
+                except Exception:
+                    pass
+
+        result["seasons"][int(s_num)] = eps
+
+    return result
+
+
+def _kino_cookie_mtime() -> int | None:
+    """
+    Возвращает mtime файла cookies (в секундах) или None.
+    Нужен, чтобы после логина обновлять cookies во всех драйверах пула.
+    """
+    try:
+        from kino_parser import COOKIE_FILE, COOKIE_FILE_LEGACY
+
+        path = COOKIE_FILE if os.path.exists(COOKIE_FILE) else COOKIE_FILE_LEGACY
+        if os.path.exists(path):
+            return int(os.path.getmtime(path) or 0)
+    except Exception:
+        return None
+    return None
+
+
+# -------------------------------------------------------
 # Поиск по названию на сайте
 # -------------------------------------------------------
 def search_titles(query: str, limit=1, status_cb=None, driver=None, cancel_event=None) -> List[Tuple[str, str]]:
@@ -137,11 +656,48 @@ def _extract_display_name(driver, item_url, cancel_event=None) -> str:
         slug = re.sub(r"[#?].*$", "", item_url).rstrip("/").split("/")[-1]
         return (slug.replace("-", " ").strip() or "video")
 
+def _normalize_display_name(name: str) -> str:
+    """
+    Нормализует имя файла (без расширения) для Windows:
+    - убирает .mp4 (если прилетело)
+    - запрещённые символы -> пробел
+    - схлопывает пробелы
+    - триммит пробелы/точки по краям
+    """
+    name = (name or "").strip()
+    if not name:
+        return "video"
+
+    try:
+        if name.lower().endswith(".mp4"):
+            name = name[:-4]
+    except Exception:
+        pass
+
+    try:
+        name = re.sub(r'[\\/:*?"<>|]', " ", name)
+        name = re.sub(r"\s{2,}", " ", name)
+        name = name.strip(" .")
+    except Exception:
+        pass
+
+    return name or "video"
+
 
 # -------------------------------------------------------
 # ОДНО скачивание (с возможностью передать внешний driver из пула)
 # -------------------------------------------------------
-def download(query_or_url: str, out_dir=".", status_cb=None, driver=None, cancel_event=None) -> bool:
+def download(
+    query_or_url: str,
+    out_dir=".",
+    status_cb=None,
+    driver=None,
+    cancel_event=None,
+    audio_select_cb=None,
+    defer_mux: bool = False,
+    display_name_override: str | None = None,
+    audio_parallel_tracks: int | None = None,
+) -> bool:
     """
     Скачивание одного фильма.
     Если driver передан (из DriverPool) — используем его, иначе сами поднимем скрытый UC.
@@ -153,23 +709,82 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None, cancel
         # ======= ЕСЛИ ПЕРЕДАН driver (пул UC) =======
         if driver is not None:
             try:
-                if not getattr(driver, "_kino_cookies_loaded", False):
+                cookie_mtime = _kino_cookie_mtime()
+                loaded_mtime = int(getattr(driver, "_kino_cookies_mtime", 0) or 0)
+                need_reload = (not getattr(driver, "_kino_cookies_loaded", False)) or (
+                    cookie_mtime and cookie_mtime != loaded_mtime
+                )
+
+                if need_reload:
                     driver.get(KINOPUB_BASE + "/")
-                    load_cookies(driver)
+                    ok = bool(load_cookies(driver))
                     driver.refresh()
-                    setattr(driver, "_kino_cookies_loaded", True)
+                    setattr(driver, "_kino_cookies_loaded", ok)
+                    if cookie_mtime:
+                        setattr(driver, "_kino_cookies_mtime", int(cookie_mtime))
+                    # после перезаливки cookies лучше перепроверить логин
+                    setattr(driver, "_kino_login_ok", False)
+                    setattr(driver, "_kino_login_checked_at", 0)
             except Exception as e:
                 _log(status_cb, f"⚠️ Ошибка подгрузки cookies в драйвер пула: {e}")
 
-            if not _check_login_on(driver, status_cb):
-                _log(status_cb, "⚠️ Сессия неактивна — требуется вход.")
-                return False
+            # Быстрый путь: если этим драйвером уже недавно подтверждали логин —
+            # не делаем лишних переходов (они заметно замедляют старт скачивания).
+            try:
+                checked_at = float(getattr(driver, "_kino_login_checked_at", 0) or 0)
+                login_ok = bool(getattr(driver, "_kino_login_ok", False))
+                if (not login_ok) or (time.time() - checked_at > 180):
+                    if not _check_login_on(driver, status_cb):
+                        # Иногда проверка ложно падает из-за CF/таймаута.
+                        # Если cookies выглядят валидно — пробуем продолжить (реальная проверка всё равно будет на item_url).
+                        try:
+                            from kino_parser import has_valid_session
+
+                            if has_valid_session():
+                                _log(
+                                    status_cb,
+                                    "⚠️ Не удалось подтвердить сессию в браузере (возможно CF/таймаут) — продолжаю по cookies…",
+                                )
+                                setattr(driver, "_kino_login_ok", True)
+                                setattr(driver, "_kino_login_checked_at", time.time())
+                            else:
+                                setattr(driver, "_kino_login_ok", False)
+                                setattr(driver, "_kino_login_checked_at", time.time())
+                                _log(status_cb, "⚠️ Сессия неактивна — требуется вход.")
+                                return False
+                        except Exception:
+                            setattr(driver, "_kino_login_ok", False)
+                            setattr(driver, "_kino_login_checked_at", time.time())
+                            _log(status_cb, "⚠️ Сессия неактивна — требуется вход.")
+                            return False
+                    else:
+                        setattr(driver, "_kino_login_ok", True)
+                        setattr(driver, "_kino_login_checked_at", time.time())
+            except Exception:
+                if not _check_login_on(driver, status_cb):
+                    try:
+                        from kino_parser import has_valid_session
+
+                        if not has_valid_session():
+                            _log(status_cb, "⚠️ Сессия неактивна — требуется вход.")
+                            return False
+                        _log(
+                            status_cb,
+                            "⚠️ Не удалось подтвердить сессию в браузере (возможно CF/таймаут) — продолжаю по cookies…",
+                        )
+                    except Exception:
+                        _log(status_cb, "⚠️ Сессия неактивна — требуется вход.")
+                        return False
+                try:
+                    setattr(driver, "_kino_login_ok", True)
+                    setattr(driver, "_kino_login_checked_at", time.time())
+                except Exception:
+                    pass
 
             use_driver = driver
 
         else:
             raise RuntimeError("Download() must be called with driver — internal UC driver forbidden.")
-
 
         # ======= ДАЛЬШЕ ИСПОЛЬЗУЕМ use_driver =======
 
@@ -196,12 +811,11 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None, cancel
             return False
 
         _log(status_cb, "📋 Извлекаю название...")
-        display_name = _extract_display_name(use_driver, item_url, cancel_event=cancel_event)
-
-        # --- НОРМАЛИЗАЦИЯ имени ---
-        # убираем готовое расширение, если вдруг есть
-        if display_name.lower().endswith(".mp4"):
-            display_name = display_name[:-4]
+        if display_name_override:
+            display_name = str(display_name_override)
+        else:
+            display_name = _extract_display_name(use_driver, item_url, cancel_event=cancel_event)
+        display_name = _normalize_display_name(display_name)
 
         # формируем output
         out_path = os.path.join(out_dir, display_name + ".mp4")
@@ -226,6 +840,9 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None, cancel
             driver=use_driver,
             status_cb=status_cb,
             cancel_event=cancel_event,
+            audio_select_cb=audio_select_cb,
+            defer_mux=defer_mux,
+            audio_parallel_tracks=audio_parallel_tracks,
         )
 
         if getattr(cancel_event, "is_set", lambda: False)():
@@ -238,10 +855,11 @@ def download(query_or_url: str, out_dir=".", status_cb=None, driver=None, cancel
         if not ok:
             _log(status_cb, "❌ Ошибка при скачивании.")
         else:
-            _log(status_cb, "✅ Скачивание завершено.")
+            if defer_mux:
+                _log(status_cb, "🎞 Готово к конвертации.")
+            else:
+                _log(status_cb, "✅ Скачивание завершено.")
         return ok
-
-        
 
     except Exception as e:
         _log(status_cb, f"❌ Ошибка: {e}")

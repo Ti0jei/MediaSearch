@@ -12,7 +12,7 @@ import urllib.request
 from tkinter import messagebox, ttk
 
 # ==== НАСТРОЙКИ ====
-APP_VERSION = "1.0.7"  # Текущая версия приложения (меняй при релизе)
+APP_VERSION = "1.0.8"  # Текущая версия приложения (меняй при релизе)
 GITHUB_OWNER = "Ti0jei"  # Твой GitHub
 GITHUB_REPO = "MediaSearch"  # Репозиторий
 INSTALL_ARGS = []  # Например ['/VERYSILENT'] для тихой установки
@@ -142,28 +142,119 @@ def _fetch_latest_via_version_json(timeout=12):
 
 # ---- установка ----
 def _run_installer_and_exit(installer_path):
+    _run_installer_and_exit_with_root(installer_path, root=None)
+
+
+def _run_installer_and_exit_with_root(installer_path, root=None):
+    """
+    Запуск установщика так, чтобы он не ругался на «приложение открыто».
+    Идея: запускаем отдельный wait-скрипт (detach), затем форсим закрытие приложения,
+    и уже после выхода процесса запускается установщик.
+    """
+    installer_path = os.path.normpath(str(installer_path))
+
+    def _spawn_waiter():
+        if os.name != "nt":
+            # На не-Windows просто запускаем установщик и выходим.
+            cmd = [installer_path] + list(INSTALL_ARGS or [])
+            subprocess.Popen(cmd, close_fds=True, shell=False)
+            return
+
+        pid = str(os.getpid())
+        args = " ".join(f"\"{a}\"" for a in (INSTALL_ARGS or []))
+
+        # NOTE: cmd/bat проще и надежнее, чем powershell policy на некоторых системах.
+        script = f"""@echo off
+set PID={pid}
+:wait
+tasklist /FI "PID eq %PID%" | find "%PID%" >nul
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >nul
+  goto wait
+)
+start "" "{installer_path}" {args}
+del "%~f0" >nul 2>&1
+"""
+        tmp_dir = tempfile.gettempdir()
+        bat_path = os.path.join(tmp_dir, f"MediaSearch_update_wait_{pid}.cmd")
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(script)
+
+        # Запускаем в фоне (чтобы он не умер вместе с приложением).
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", "", bat_path],
+            close_fds=True,
+            shell=False,
+            creationflags=0x08000000 if os.name == "nt" else 0,  # CREATE_NO_WINDOW
+        )
+
     try:
-        cmd = [installer_path] + INSTALL_ARGS
-        subprocess.Popen(cmd, close_fds=True, shell=False)
+        _spawn_waiter()
     except Exception as e:
-        messagebox.showerror("Обновление", f"Не удалось запустить установщик:\n{e}")
+        try:
+            messagebox.showerror("Обновление", f"Не удалось подготовить установку:\n{e}")
+        except Exception:
+            pass
         return
+
+    # Просим приложение закрыться «по-настоящему» (не в трей).
+    def _request_exit():
+        cb = None
+        try:
+            cb = getattr(root, "_force_exit_app", None)
+        except Exception:
+            cb = None
+        if callable(cb):
+            cb()
+            return
+        try:
+            if root is not None and getattr(root, "winfo_exists", lambda: False)():
+                root.destroy()
+        except Exception:
+            pass
+        try:
+            sys.exit(0)
+        except SystemExit:
+            pass
+
+    if root is not None:
+        try:
+            root.after(0, _request_exit)
+        except Exception:
+            _request_exit()
+    else:
+        _request_exit()
+
+
+# ===================== UI ОБНОВЛЕНИЯ (в стиле приложения) =====================
+
+_FALLBACK_THEME = {
+    # соответствует тёмной теме из основного приложения
+    "BG_WINDOW":  "#0f1720",
+    "BG_SURFACE": "#131f2b",
+    "BG_CARD":    "#172637",
+    "BORDER":     "#26384b",
+    "TEXT":       "#f3f7ff",
+    "SUBTEXT":    "#a6b2c5",
+    "TEXT_ON_ACCENT": "#0b1220",
+    "HOVER_BG":   "#1b2b3a",
+    "ACCENT":        "#bb86fc",
+    "ACCENT_SECOND": "#bb86fc",
+}
+
+
+def _get_theme(root) -> dict:
+    """
+    Берём палитру прямо из приложения (root._theme_palette),
+    чтобы окно обновления выглядело 1-в-1 как текущая тема.
+    """
     try:
-        sys.exit(0)
-    except SystemExit:
+        pal = getattr(root, "_theme_palette", None)
+        if isinstance(pal, dict) and pal.get("BG_SURFACE") and pal.get("TEXT"):
+            return pal
+    except Exception:
         pass
-
-
-# ===================== КРАСИВЫЙ UI ОБНОВЛЕНИЯ =====================
-
-# Цвета в стиле Movie Tools
-BG_WINDOW = "#05051A"   # тёмный фон
-BG_PANEL = "#101427"    # карточка
-ACCENT = "#FF4FA3"      # розовый акцент
-ACCENT_2 = "#7C4DFF"    # сиреневый прогресс
-FG_TEXT = "#F5F5FF"
-FG_MUTED = "#9AA0C2"
-BORDER = "#272C45"
+    return _FALLBACK_THEME.copy()
 
 
 class UpdateDialog(tk.Toplevel):
@@ -176,8 +267,19 @@ class UpdateDialog(tk.Toplevel):
         self.on_skip_cb = on_skip
         self.on_later_cb = on_later
 
+        theme = _get_theme(parent)
+        BG_WINDOW = theme.get("BG_WINDOW") or _FALLBACK_THEME["BG_WINDOW"]
+        BG_SURFACE = theme.get("BG_SURFACE") or _FALLBACK_THEME["BG_SURFACE"]
+        BG_CARD = theme.get("BG_CARD") or _FALLBACK_THEME["BG_CARD"]
+        BORDER = theme.get("BORDER") or _FALLBACK_THEME["BORDER"]
+        TEXT = theme.get("TEXT") or _FALLBACK_THEME["TEXT"]
+        SUBTEXT = theme.get("SUBTEXT") or _FALLBACK_THEME["SUBTEXT"]
+        ACCENT = theme.get("ACCENT") or _FALLBACK_THEME["ACCENT"]
+        ACCENT_2 = theme.get("ACCENT_SECOND") or ACCENT
+        HOVER_BG = theme.get("HOVER_BG") or BG_CARD
+
         self.title(f"Доступно обновление {latest['version']}")
-        self.configure(bg=BG_WINDOW)
+        self.configure(bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
         self.resizable(False, False)
         # Иконка окна (та же, что у основного EXE)
         try:
@@ -209,31 +311,37 @@ class UpdateDialog(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
+        # фирменная верхняя полоска
+        try:
+            tk.Frame(self, bg=ACCENT, height=3).pack(fill="x", side="top")
+        except Exception:
+            pass
+
         # стили
         style = ttk.Style(self)
         style.theme_use("clam")
 
-        style.configure("Update.TFrame", background=BG_WINDOW)
-        style.configure("Card.TFrame", background=BG_PANEL, bordercolor=BORDER,
+        style.configure("Update.TFrame", background=BG_SURFACE)
+        style.configure("Card.TFrame", background=BG_CARD, bordercolor=BORDER,
                         borderwidth=1, relief="solid")
-        style.configure("Title.TLabel", background=BG_WINDOW, foreground=FG_TEXT,
+        style.configure("Title.TLabel", background=BG_SURFACE, foreground=TEXT,
                         font=("Segoe UI Semibold", 16))
-        style.configure("SubTitle.TLabel", background=BG_WINDOW, foreground=FG_MUTED,
+        style.configure("SubTitle.TLabel", background=BG_SURFACE, foreground=SUBTEXT,
                         font=("Segoe UI", 10))
-        style.configure("CardTitle.TLabel", background=BG_PANEL, foreground=FG_TEXT,
+        style.configure("CardTitle.TLabel", background=BG_CARD, foreground=TEXT,
                         font=("Segoe UI Semibold", 11))
-        style.configure("CardText.TLabel", background=BG_PANEL, foreground=FG_MUTED,
+        style.configure("CardText.TLabel", background=BG_CARD, foreground=SUBTEXT,
                         font=("Segoe UI", 9))
         style.configure("Accent.TButton", font=("Segoe UI Semibold", 10),
-                        foreground=FG_TEXT, background=ACCENT,
+                        foreground=TEXT, background=ACCENT,
                         borderwidth=0, focusthickness=0, padding=(14, 6))
-        style.map("Accent.TButton", background=[("active", "#ff6ab1")])
+        style.map("Accent.TButton", background=[("active", ACCENT_2)])
         style.configure("Ghost.TButton", font=("Segoe UI", 10),
-                        foreground=FG_MUTED, background=BG_PANEL,
+                        foreground=TEXT, background=BG_CARD,
                         borderwidth=1, bordercolor=BORDER, padding=(12, 5))
-        style.map("Ghost.TButton", background=[("active", "#191f35")])
+        style.map("Ghost.TButton", background=[("active", HOVER_BG)])
         style.configure("Update.Horizontal.TProgressbar",
-                        troughcolor=BG_PANEL, bordercolor=BG_PANEL,
+                        troughcolor=BG_CARD, bordercolor=BG_CARD,
                         background=ACCENT_2, thickness=6)
 
         # корневой фрейм
@@ -268,12 +376,12 @@ class UpdateDialog(tk.Toplevel):
 
         self.txt = tk.Text(
             card,
-            bg=BG_PANEL,
-            fg=FG_TEXT,
-            insertbackground=FG_TEXT,
+            bg=BG_CARD,
+            fg=TEXT,
+            insertbackground=TEXT,
             relief="flat",
             height=7,
-            font=("Consolas", 9),
+            font=("Segoe UI", 9),
             wrap="word",
         )
         self.txt.pack(fill="both", expand=True, pady=(4, 8))
@@ -413,7 +521,7 @@ def _show_prompt(root, latest: dict):
                         )
 
                 # Успех: запускаем установщик и выходим
-                root.after(0, lambda: _run_installer_and_exit(dest))
+                root.after(0, lambda: _run_installer_and_exit_with_root(dest, root=root))
             except Exception as e:
                 def _on_err():
                     dlg.set_buttons_enabled(True)

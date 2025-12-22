@@ -29,7 +29,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import threading
-from kino_hls import set_reencode as set_hls_reencode
+from kino_hls import set_reencode as set_hls_reencode, retry_mux as hls_retry_mux
 def ui_card(parent, *, title=None, subtitle=None, width=None):
     outer = tk.Frame(parent, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
     tk.Frame(outer, bg=ACCENT, height=3).pack(fill="x", side="top")
@@ -55,6 +55,24 @@ def ui_card(parent, *, title=None, subtitle=None, width=None):
     return outer, body
 
 def open_settings():
+    # На Windows overlay-снежок рисуется отдельным прозрачным окном.
+    # Во время модальных диалогов (grab_set) он может блокировать клики,
+    # поэтому временно отключаем overlay, оставляя безопасный SnowStrip.
+    try:
+        _prev_snow_suspend = bool(getattr(root, "_snow_overlay_suspended", False))
+    except Exception:
+        _prev_snow_suspend = False
+    try:
+        root._snow_overlay_suspended = True
+    except Exception:
+        pass
+    try:
+        ov = getattr(root, "_snow_overlay", None)
+        if ov is not None:
+            ov.set_enabled(False)
+    except Exception:
+        pass
+
     dlg = tk.Toplevel(root)
     try:
         dlg.iconbitmap(get_app_icon())
@@ -127,6 +145,16 @@ def open_settings():
     rb1.pack(side="left", padx=(0, 12))
     rb2.pack(side="left")
 
+    tk.Label(
+        body,
+        text="🎄 Новогодняя тема включается автоматически: 24 декабря — 31 января.",
+        bg=BG_SURFACE,
+        fg=SUBTEXT,
+        font=("Segoe UI", 9),
+        wraplength=480,
+        justify="left",
+    ).pack(anchor="w", pady=(2, 0))
+
     # --- КОНВЕРТАЦИЯ HLS ---
     tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=10)
 
@@ -192,6 +220,10 @@ def open_settings():
         justify="center",
     )
     sp.pack(side="left", padx=(8, 0))
+    try:
+        style_entry(sp)
+    except Exception:
+        pass
 
     tk.Label(
         body,
@@ -216,6 +248,73 @@ def open_settings():
         save_settings(ss)
 
     max_parallel_var.trace_add("write", _save_max_parallel)
+
+    def _clamp_audio_parallel(v) -> int:
+        try:
+            v = int(v)
+        except Exception:
+            v = 1
+        return max(1, min(4, v))
+
+    audio_parallel_var = tk.IntVar(value=_clamp_audio_parallel(s.get("kino_audio_parallel_tracks", 1)))
+
+    row_ap = tk.Frame(body, bg=BG_SURFACE)
+    row_ap.pack(anchor="w", pady=(10, 0))
+    tk.Label(row_ap, text="Параллельные аудиодорожки (на файл):", bg=BG_SURFACE, fg=TEXT, font=("Segoe UI", 10))\
+        .pack(side="left")
+
+    sp_ap = tk.Spinbox(
+        row_ap,
+        from_=1,
+        to=4,
+        width=4,
+        textvariable=audio_parallel_var,
+        bg=FIELD_BG,
+        fg=TEXT,
+        insertbackground=TEXT,
+        relief="flat",
+        font=("Segoe UI", 10),
+        justify="center",
+    )
+    sp_ap.pack(side="left", padx=(8, 0))
+    try:
+        style_entry(sp_ap)
+    except Exception:
+        pass
+
+    tk.Label(
+        body,
+        text="Ускоряет тайтлы с большим числом дорожек, но повышает нагрузку на сеть.",
+        bg=BG_SURFACE,
+        fg=SUBTEXT,
+        font=("Segoe UI", 9),
+    ).pack(anchor="w", pady=(4, 0))
+
+    def _save_audio_parallel(*_):
+        try:
+            v = _clamp_audio_parallel(audio_parallel_var.get())
+        except Exception:
+            return
+        try:
+            if int(audio_parallel_var.get()) != v:
+                audio_parallel_var.set(v)
+        except Exception:
+            pass
+        ss = load_settings()
+        ss["kino_audio_parallel_tracks"] = v
+        save_settings(ss)
+        try:
+            root._kino_audio_parallel_tracks = int(v)
+        except Exception:
+            pass
+        try:
+            cb = getattr(root, "_update_kino_queue_rowheight", None)
+            if callable(cb):
+                cb()
+        except Exception:
+            pass
+
+    audio_parallel_var.trace_add("write", _save_audio_parallel)
 
     queue_persist_var = tk.BooleanVar(value=bool(s.get("kino_queue_persist", True)))
     queue_autostart_var = tk.BooleanVar(value=bool(s.get("kino_queue_autostart_after_login", True)))
@@ -271,6 +370,43 @@ def open_settings():
     auto_chk.pack(anchor="w")
     if not bool(queue_persist_var.get()):
         auto_chk.config(state="disabled")
+
+    auto_convert_var = tk.BooleanVar(value=bool(s.get("kino_auto_convert_all_audio", False)))
+
+    def on_auto_convert_toggle():
+        v = bool(auto_convert_var.get())
+        ss = load_settings()
+        ss["kino_auto_convert_all_audio"] = v
+        save_settings(ss)
+        try:
+            setattr(root, "_kino_auto_convert_all_audio", v)
+        except Exception:
+            pass
+
+    auto_convert_chk = tk.Checkbutton(
+        body,
+        text="Авто-конвертация (MUX) после загрузки — все аудиодорожки",
+        variable=auto_convert_var,
+        command=on_auto_convert_toggle,
+        bg=BG_SURFACE,
+        fg=TEXT,
+        activebackground=BG_SURFACE,
+        activeforeground=TEXT,
+        selectcolor=BG_CARD,
+        highlightthickness=0,
+        bd=0,
+        font=("Segoe UI", 10),
+    )
+    auto_convert_chk.pack(anchor="w", pady=(8, 0))
+    tk.Label(
+        body,
+        text="Если выключено — после загрузки будет статус «Готово к конвертации» и нужно нажать «Конвертировать».",
+        bg=BG_SURFACE,
+        fg=SUBTEXT,
+        font=("Segoe UI", 9),
+        wraplength=480,
+        justify="left",
+    ).pack(anchor="w", pady=(4, 0))
 
     # --- KINO.PUB PROFILE PURGE ON STARTUP ---
     tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=10)
@@ -478,6 +614,8 @@ def open_settings():
         start_chk.config(state="disabled")
         autostart_chk.config(state="disabled")
 
+    tk.Frame(body, bg=BG_SURFACE).pack(fill="both", expand=True)
+
     btn_row = tk.Frame(body, bg=BG_SURFACE)
     btn_row.pack(fill="x", pady=(18, 0))
 
@@ -509,22 +647,93 @@ def open_settings():
 
     dlg.bind("<Escape>", lambda e: dlg.destroy())
     dlg.bind("<Return>", lambda e: dlg.destroy())
+
+    def _close_settings():
+        try:
+            dlg.grab_release()
+        except Exception:
+            pass
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+
+        try:
+            root._snow_overlay_suspended = _prev_snow_suspend
+        except Exception:
+            pass
+
+        # Возвращаем overlay только если он не был ранее "засуспенжен"
+        if not _prev_snow_suspend:
+            try:
+                enabled = bool(getattr(root, "_holiday_theme", False))
+            except Exception:
+                enabled = False
+            try:
+                ov2 = getattr(root, "_snow_overlay", None)
+                if ov2 is not None:
+                    ov2.set_enabled(enabled)
+            except Exception:
+                pass
+
+    try:
+        dlg.protocol("WM_DELETE_WINDOW", _close_settings)
+    except Exception:
+        pass
+    try:
+        b.config(command=_close_settings)
+    except Exception:
+        pass
+    try:
+        dlg.bind("<Escape>", lambda e: _close_settings())
+        dlg.bind("<Return>", lambda e: _close_settings())
+    except Exception:
+        pass
     
 APP_ICON = None
-def get_app_icon():
+def get_app_icon() -> str:
     global APP_ICON
     if APP_ICON:
         return APP_ICON
-    try:
-        APP_ICON = resource_path("icon.ico")
-    except Exception:
-        APP_ICON = "icon.ico"
+    APP_ICON = resource_path("icon.ico")
     return APP_ICON
 
 def resource_path(rel_path: str) -> str:
-    # PyInstaller: onefile распаковывает во временную папку _MEIPASS
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, rel_path)
+    # PyInstaller: onedir держит файлы рядом с exe (dist\\...\\icon.ico),
+    # а sys._MEIPASS может указывать на dist\\...\\_internal. Поддерживаем оба.
+    bases: list[str] = []
+    try:
+        if getattr(sys, "frozen", False):
+            bases.append(os.path.dirname(sys.executable))
+            meipass = getattr(sys, "_MEIPASS", None)
+            if isinstance(meipass, str) and meipass:
+                bases.append(meipass)
+    except Exception:
+        pass
+    try:
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    try:
+        bases.append(os.getcwd())
+    except Exception:
+        pass
+
+    for base in bases:
+        try:
+            full = os.path.join(base, rel_path)
+            if os.path.exists(full):
+                return full
+        except Exception:
+            continue
+
+    # fallback: возвращаем путь из первого base (или относительный)
+    for base in bases:
+        try:
+            return os.path.join(base, rel_path)
+        except Exception:
+            continue
+    return rel_path
 
 META_EXTENSIONS = set(RELATED_EXTENSIONS) | {
     ".nfo", ".xml", ".jpg", ".jpeg", ".png", ".webp", ".tbn"
@@ -845,6 +1054,42 @@ THEMES = {
 
 CURRENT_THEME = "dark"
 
+# -----------------
+# Seasonal themes 🎄
+# -----------------
+HOLIDAY_OVERRIDES = {
+    # Новогодняя палитра: красный/зелёный/белый
+    "ACCENT": "#d32f2f",        # red 700
+    "ACCENT_HOVER": "#ef5350",  # red 400
+    "ACCENT_SECOND": "#2e7d32", # green 800
+    "TEXT_ON_ACCENT": "#ffffff",
+}
+
+
+def _is_holiday_season(dt: datetime | None = None) -> bool:
+    """
+    Новогодняя тема активна автоматически: 24 декабря — 31 января (включительно).
+    """
+    try:
+        dt = dt or datetime.now()
+        m = int(getattr(dt, "month", 0) or 0)
+        d = int(getattr(dt, "day", 0) or 0)
+    except Exception:
+        return False
+
+    if m == 12 and d >= 24:
+        return True
+    if m == 1 and d <= 31:
+        return True
+    return False
+
+
+def _build_theme_palette(theme_name: str, *, holiday: bool = False) -> dict:
+    base = THEMES.get(theme_name, THEMES["dark"]).copy()
+    if holiday:
+        base.update(HOLIDAY_OVERRIDES)
+    return base
+
 # Глобальные цвета (как у тебя сейчас)
 BG_WINDOW  = THEMES[CURRENT_THEME]["BG_WINDOW"]
 BG_SURFACE = THEMES[CURRENT_THEME]["BG_SURFACE"]
@@ -871,13 +1116,17 @@ OK2        = THEMES[CURRENT_THEME]["OK2"]
 
 
 def _apply_globals_from_theme(theme_name: str):
+    _apply_globals_from_palette(theme_name, THEMES[theme_name])
+
+
+def _apply_globals_from_palette(theme_name: str, palette: dict):
     global CURRENT_THEME
     global BG_WINDOW, BG_SURFACE, BG_CARD, BORDER, TEXT, SUBTEXT
     global ACCENT, ACCENT_HOVER, ACCENT_SECOND
     global HOVER_BG, ACTIVE_BG, FIELD_BG, FIELD_BG_2, HEADER_BG, MENU_BG
     global ERROR, WARN, OK, OK2
-    global TEXT_ON_ACCENT 
-    t = THEMES[theme_name]
+    global TEXT_ON_ACCENT
+    t = palette
     CURRENT_THEME = theme_name
     TEXT_ON_ACCENT = t["TEXT_ON_ACCENT"]
     BG_WINDOW  = t["BG_WINDOW"]
@@ -1074,6 +1323,7 @@ def _color_map_update(root_widget, old: dict, new: dict):
         "disabledforeground",
         "disabledbackground",
         "readonlybackground",
+        "buttonbackground",
         "selectbackground",
         "selectforeground",
     )
@@ -1152,10 +1402,27 @@ def apply_theme(root: tk.Tk, theme_name: str):
     if theme_name not in THEMES:
         return
 
-    old = THEMES.get(CURRENT_THEME, THEMES["dark"]).copy()
-    _apply_globals_from_theme(theme_name)
+    try:
+        old = getattr(root, "_theme_palette", None) or THEMES.get(CURRENT_THEME, THEMES["dark"]).copy()
+    except Exception:
+        old = THEMES.get(CURRENT_THEME, THEMES["dark"]).copy()
+
+    try:
+        try:
+            root._holiday_theme = _is_holiday_season()
+        except Exception:
+            root._holiday_theme = False
+        holiday = bool(getattr(root, "_holiday_theme", False))
+    except Exception:
+        holiday = False
+
+    new = _build_theme_palette(theme_name, holiday=holiday)
+    _apply_globals_from_palette(theme_name, new)
     apply_ttk_theme()
-    new = THEMES[theme_name].copy()
+    try:
+        root._theme_palette = new.copy()
+    except Exception:
+        pass
 
     # прокатываем замену цветов по всему дереву виджетов
     _color_map_update(root, old, new)
@@ -1201,6 +1468,66 @@ def apply_theme(root: tk.Tk, theme_name: str):
 
     try:
         root.configure(bg=BG_WINDOW)
+    except Exception:
+        pass
+
+    # Новогодний "снежок" (если включён)
+    try:
+        enabled = bool(getattr(root, "_holiday_theme", False))
+    except Exception:
+        enabled = False
+    try:
+        overlay_allowed = enabled and (not bool(getattr(root, "_snow_overlay_suspended", False)))
+    except Exception:
+        overlay_allowed = enabled
+
+    # безопасная полоска всегда ок
+    try:
+        strip = getattr(root, "_snow_strip", None)
+        if strip is not None:
+            try:
+                strip.update_theme()
+            except Exception:
+                pass
+            try:
+                strip.set_enabled(enabled)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # overlay по всему окну может быть отключён во время модальных окон
+    try:
+        ov = getattr(root, "_snow_overlay", None)
+        if ov is not None:
+            try:
+                ov.update_theme()
+            except Exception:
+                pass
+            try:
+                ov.set_enabled(overlay_allowed)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Снеговик в шапке
+    try:
+        snowman = getattr(root, "_snowman_label", None)
+        if snowman is not None:
+            try:
+                snowman.configure(bg=BG_SURFACE, fg=TEXT)
+            except Exception:
+                pass
+            try:
+                if bool(getattr(root, "_holiday_theme", False)):
+                    if not snowman.winfo_ismapped():
+                        snowman.pack(side="left", padx=(6, 0), pady=10)
+                else:
+                    if snowman.winfo_ismapped():
+                        snowman.pack_forget()
+            except Exception:
+                pass
     except Exception:
         pass
     
@@ -1294,9 +1621,659 @@ def fade_in(window, alpha=0.0):
         window.attributes("-alpha", alpha)
         window.after(20, lambda: fade_in(window, alpha))
 
+
+class SnowStrip:
+    """
+    Небольшой декоративный "снежок" под шапкой.
+    Рисуется на Canvas и не перекрывает элементы управления.
+    """
+
+    def __init__(self, root: tk.Tk, *, after_widget: tk.Widget, height: int = 28):
+        self.root = root
+        self.after_widget = after_widget
+        self.height = max(18, int(height))
+
+        self.frame = tk.Frame(root, bg=BG_SURFACE, height=self.height)
+        self.frame.pack_propagate(False)
+
+        self.canvas = tk.Canvas(
+            self.frame,
+            bg=BG_SURFACE,
+            height=self.height,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        self._enabled = False
+        self._job = None
+        self._flakes: list[dict] = []
+        self.frame.bind("<Configure>", lambda _e: self._ensure_flakes())
+
+    def _flake_color(self) -> str:
+        try:
+            if CURRENT_THEME == "light":
+                return _mix(SUBTEXT, BG_SURFACE, 0.35)
+            return _mix(TEXT, BG_SURFACE, 0.15)
+        except Exception:
+            return "#ffffff" if CURRENT_THEME != "light" else "#90a4ae"
+
+    def show(self):
+        try:
+            if self.frame.winfo_ismapped():
+                return
+        except Exception:
+            pass
+        try:
+            self.frame.pack(after=self.after_widget, side="top", fill="x")
+        except Exception:
+            try:
+                self.frame.pack(side="top", fill="x")
+            except Exception:
+                pass
+
+    def hide(self):
+        try:
+            if self._job is not None:
+                try:
+                    self.root.after_cancel(self._job)
+                except Exception:
+                    pass
+                self._job = None
+            self.canvas.delete("all")
+            self._flakes.clear()
+        except Exception:
+            pass
+        try:
+            self.frame.pack_forget()
+        except Exception:
+            pass
+
+    def set_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._enabled:
+            if enabled:
+                self.update_theme()
+            return
+
+        self._enabled = enabled
+        if not enabled:
+            self.hide()
+            return
+
+        self.show()
+        self.update_theme()
+        self._ensure_flakes()
+        self._tick()
+
+    def update_theme(self):
+        try:
+            self.frame.configure(bg=BG_SURFACE)
+            self.canvas.configure(bg=BG_SURFACE)
+        except Exception:
+            pass
+
+        try:
+            c = self._flake_color()
+            for f in self._flakes:
+                try:
+                    self.canvas.itemconfigure(f["id"], fill=c, outline="")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _ensure_flakes(self):
+        if not self._enabled:
+            return
+
+        try:
+            w = int(self.canvas.winfo_width() or 0)
+            h = int(self.canvas.winfo_height() or self.height or 0)
+        except Exception:
+            w, h = 0, self.height
+
+        if w < 50 or h < 10:
+            try:
+                self.root.after(120, self._ensure_flakes)
+            except Exception:
+                pass
+            return
+
+        desired = max(18, min(90, int(w / 22)))
+        c = self._flake_color()
+
+        while len(self._flakes) < desired:
+            r = random.randint(1, 3)
+            x = random.uniform(0, w)
+            y = random.uniform(0, h)
+            vy = random.uniform(0.6, 1.9) + (r * 0.2)
+            vx = random.uniform(-0.25, 0.25)
+            fid = self.canvas.create_oval(x - r, y - r, x + r, y + r, fill=c, outline="")
+            self._flakes.append({"id": fid, "x": x, "y": y, "r": r, "vy": vy, "vx": vx})
+
+        while len(self._flakes) > desired:
+            f = self._flakes.pop()
+            try:
+                self.canvas.delete(f["id"])
+            except Exception:
+                pass
+
+    def _tick(self):
+        if not self._enabled:
+            return
+
+        try:
+            w = int(self.canvas.winfo_width() or 0)
+            h = int(self.canvas.winfo_height() or self.height or 0)
+        except Exception:
+            w, h = 0, self.height
+
+        if w <= 0 or h <= 0:
+            self._job = self.root.after(120, self._tick)
+            return
+
+        for f in list(self._flakes):
+            try:
+                f["y"] += float(f["vy"])
+                f["x"] += float(f["vx"])
+
+                r = float(f["r"])
+                if f["y"] > (h + r + 2):
+                    f["y"] = -r
+                    f["x"] = random.uniform(0, w)
+                    f["vy"] = random.uniform(0.6, 1.9) + (r * 0.2)
+                    f["vx"] = random.uniform(-0.25, 0.25)
+
+                if f["x"] < -r:
+                    f["x"] = w + r
+                elif f["x"] > (w + r):
+                    f["x"] = -r
+
+                self.canvas.coords(f["id"], f["x"] - r, f["y"] - r, f["x"] + r, f["y"] + r)
+            except Exception:
+                pass
+
+        self._job = self.root.after(33, self._tick)
+
+
+class SnowOverlay:
+    """
+    Снежок поверх всего окна (Windows):
+    - отдельный прозрачный Toplevel с Canvas
+    - click-through через WS_EX_TRANSPARENT, чтобы не ломать клики/скролл
+    """
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self._enabled = False
+        self._job = None
+        self._sync_job = None
+        self._flakes: list[dict] = []
+        self._key = "#010203"  # «ключевой» цвет для прозрачности
+
+        self.win = tk.Toplevel(root)
+        self.win.withdraw()
+        self.win.overrideredirect(True)
+        # Не делаем transient: так модальные окна (настройки/диалоги) остаются кликабельными сверху.
+        try:
+            self.win.configure(bg=self._key)
+        except Exception:
+            pass
+        try:
+            self.win.wm_attributes("-transparentcolor", self._key)
+        except Exception:
+            # Если прозрачность недоступна — просто отключим «везде»,
+            # оставив возможность использовать SnowStrip.
+            self.win.destroy()
+            raise
+
+        self.canvas = tk.Canvas(self.win, bg=self._key, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda _e: self._ensure_flakes())
+
+        # Если вдруг click-through не сработает и overlay начнёт перехватывать клики —
+        # ловим событие и аварийно отключаем overlay, возвращая кликабельность UI.
+        try:
+            self.win.bind("<Button-1>", self._panic_disable, add="+")
+            self.win.bind("<Button-2>", self._panic_disable, add="+")
+            self.win.bind("<Button-3>", self._panic_disable, add="+")
+            self.win.bind("<MouseWheel>", self._panic_disable, add="+")
+        except Exception:
+            pass
+
+        try:
+            self.root.bind("<Configure>", self._on_root_configure, add="+")
+            self.root.bind("<Map>", self._on_root_map, add="+")
+            self.root.bind("<Unmap>", self._on_root_unmap, add="+")
+        except Exception:
+            pass
+
+        try:
+            self.root.bind("<Destroy>", self._on_root_destroy, add="+")
+        except Exception:
+            pass
+
+        # click-through (Windows): чтобы окно не перехватывало мышь
+        try:
+            self.win.update_idletasks()
+            self._set_clickthrough()
+        except Exception:
+            pass
+
+    def _panic_disable(self, _event=None):
+        # Если это событие пришло — overlay реально перехватил мышь.
+        # Мгновенно выключаем overlay и оставляем только SnowStrip.
+        try:
+            self.set_enabled(False)
+        except Exception:
+            pass
+        try:
+            enabled = bool(getattr(self.root, "_holiday_theme", False))
+        except Exception:
+            enabled = False
+        try:
+            strip = getattr(self.root, "_snow_strip", None)
+            if strip is not None:
+                strip.set_enabled(enabled)
+        except Exception:
+            pass
+        return "break"
+
+    def _on_root_configure(self, event):
+        try:
+            if event.widget is not self.root:
+                return
+        except Exception:
+            return
+        self._schedule_sync()
+
+    def _on_root_map(self, event):
+        try:
+            if event.widget is not self.root:
+                return
+        except Exception:
+            return
+        if not self._enabled:
+            return
+        try:
+            self.show()
+        except Exception:
+            self._schedule_sync()
+
+    def _on_root_unmap(self, event):
+        try:
+            if event.widget is not self.root:
+                return
+        except Exception:
+            return
+        try:
+            self.win.withdraw()
+        except Exception:
+            pass
+
+    def _on_root_destroy(self, event):
+        try:
+            if event.widget is not self.root:
+                return
+        except Exception:
+            return
+        self._safe_destroy()
+
+    def _safe_destroy(self):
+        try:
+            if self._job is not None:
+                self.root.after_cancel(self._job)
+        except Exception:
+            pass
+        self._job = None
+        try:
+            if self._sync_job is not None:
+                self.root.after_cancel(self._sync_job)
+        except Exception:
+            pass
+        self._sync_job = None
+        try:
+            if self.win.winfo_exists():
+                self.win.destroy()
+        except Exception:
+            pass
+
+    def _set_clickthrough(self):
+        """
+        Возвращает True, если click-through успешно включён.
+        Если False — overlay лучше выключить, иначе он может блокировать клики по UI.
+        """
+        if os.name != "nt":
+            return False
+        try:
+            hwnd = int(self.win.winfo_id() or 0)
+            if not hwnd:
+                return False
+
+            # 1) pywin32 (чаще работает стабильнее)
+            try:
+                import win32gui
+                import win32con
+
+                style = int(win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE))
+                WS_EX_NOACTIVATE = 0x08000000
+                new_style = int(style) | int(win32con.WS_EX_LAYERED) | int(win32con.WS_EX_TRANSPARENT) | int(
+                    win32con.WS_EX_TOOLWINDOW
+                ) | int(WS_EX_NOACTIVATE)
+
+                win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, new_style)
+                win32gui.SetWindowPos(
+                    hwnd,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    win32con.SWP_NOMOVE
+                    | win32con.SWP_NOSIZE
+                    | win32con.SWP_NOZORDER
+                    | win32con.SWP_FRAMECHANGED
+                    | win32con.SWP_NOACTIVATE,
+                )
+                after = int(win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE))
+                return bool(after & int(win32con.WS_EX_TRANSPARENT))
+            except Exception:
+                pass
+
+            # 2) ctypes fallback
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_NOACTIVATE = 0x08000000
+
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+
+            GetLong = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+            SetLong = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+            try:
+                GetLong.argtypes = [wintypes.HWND, wintypes.INT]
+                GetLong.restype = ctypes.c_ssize_t
+                SetLong.argtypes = [wintypes.HWND, wintypes.INT, ctypes.c_ssize_t]
+                SetLong.restype = ctypes.c_ssize_t
+            except Exception:
+                pass
+
+            style = int(GetLong(hwnd, GWL_EXSTYLE))
+            new_style = int(style) | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            SetLong(hwnd, GWL_EXSTYLE, new_style)
+            try:
+                user32.SetWindowPos(
+                    hwnd,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
+                )
+            except Exception:
+                pass
+
+            after = int(GetLong(hwnd, GWL_EXSTYLE))
+            return bool(after & WS_EX_TRANSPARENT)
+        except Exception:
+            return False
+
+    def _flake_color(self) -> str:
+        try:
+            if CURRENT_THEME == "light":
+                return _mix(SUBTEXT, BG_SURFACE, 0.35)
+            return _mix(TEXT, BG_SURFACE, 0.15)
+        except Exception:
+            return "#ffffff" if CURRENT_THEME != "light" else "#90a4ae"
+
+    def set_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._enabled:
+            if enabled:
+                self.update_theme()
+                self._ensure_flakes()
+                try:
+                    if not self._set_clickthrough():
+                        self._enabled = False
+                        self.hide()
+                except Exception:
+                    pass
+            return
+
+        self._enabled = enabled
+        if not enabled:
+            self.hide()
+            return
+
+        self.show()
+        self.update_theme()
+        self._ensure_flakes()
+        self._tick()
+
+    def show(self):
+        self._schedule_sync()
+        try:
+            if self.win.state() == "withdrawn":
+                self.win.deiconify()
+        except Exception:
+            try:
+                self.win.deiconify()
+            except Exception:
+                pass
+        try:
+            self.win.update_idletasks()
+            self._ensure_flakes()
+        except Exception:
+            pass
+        try:
+            if not self._set_clickthrough():
+                self._enabled = False
+                self.hide()
+                return
+        except Exception:
+            pass
+        try:
+            self.win.lift(self.root)
+        except Exception:
+            pass
+
+    def hide(self):
+        try:
+            if self._job is not None:
+                try:
+                    self.root.after_cancel(self._job)
+                except Exception:
+                    pass
+                self._job = None
+        except Exception:
+            pass
+        try:
+            self.canvas.delete("all")
+            self._flakes.clear()
+        except Exception:
+            pass
+        try:
+            self.win.withdraw()
+        except Exception:
+            pass
+
+    def update_theme(self):
+        try:
+            self.win.configure(bg=self._key)
+            self.canvas.configure(bg=self._key)
+        except Exception:
+            pass
+        try:
+            c = self._flake_color()
+            for f in self._flakes:
+                try:
+                    self.canvas.itemconfigure(f["id"], fill=c, outline="")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _schedule_sync(self):
+        if self._sync_job is not None:
+            return
+        try:
+            self._sync_job = self.root.after(60, self._sync_geometry)
+        except Exception:
+            self._sync_job = None
+            self._sync_geometry()
+
+    def _sync_geometry(self):
+        self._sync_job = None
+        if not self._enabled:
+            return
+
+        try:
+            if str(self.root.state()) == "iconic" or not bool(self.root.winfo_viewable()):
+                self.win.withdraw()
+                return
+        except Exception:
+            pass
+
+        try:
+            x = int(self.root.winfo_rootx())
+            y = int(self.root.winfo_rooty())
+            w = int(self.root.winfo_width())
+            h = int(self.root.winfo_height())
+        except Exception:
+            return
+
+        if w < 200 or h < 200:
+            try:
+                self._sync_job = self.root.after(120, self._sync_geometry)
+            except Exception:
+                pass
+            return
+
+        try:
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+            try:
+                if self.win.state() == "withdrawn":
+                    self.win.deiconify()
+            except Exception:
+                pass
+            try:
+                self.win.update_idletasks()
+                self._ensure_flakes()
+            except Exception:
+                pass
+            try:
+                if not self._set_clickthrough():
+                    self._enabled = False
+                    self.hide()
+                    return
+            except Exception:
+                pass
+            self.win.lift(self.root)
+        except Exception:
+            pass
+
+    def _ensure_flakes(self):
+        if not self._enabled:
+            return
+
+        try:
+            w = int(self.canvas.winfo_width() or 0)
+            h = int(self.canvas.winfo_height() or 0)
+        except Exception:
+            w, h = 0, 0
+
+        if w < 200 or h < 200:
+            return
+
+        try:
+            # масштабируем по площади окна, но держим в разумных пределах
+            desired = int((w * h) / 15000)
+            desired = max(90, min(260, desired))
+        except Exception:
+            desired = 140
+
+        c = self._flake_color()
+
+        while len(self._flakes) < desired:
+            r = random.randint(1, 3)
+            x = random.uniform(0, w)
+            y = random.uniform(0, h)
+            vy = random.uniform(0.7, 2.3) + (r * 0.25)
+            vx = random.uniform(-0.35, 0.35)
+            fid = self.canvas.create_oval(x - r, y - r, x + r, y + r, fill=c, outline="")
+            self._flakes.append({"id": fid, "x": x, "y": y, "r": r, "vy": vy, "vx": vx})
+
+        while len(self._flakes) > desired:
+            f = self._flakes.pop()
+            try:
+                self.canvas.delete(f["id"])
+            except Exception:
+                pass
+
+    def _tick(self):
+        if not self._enabled:
+            return
+
+        try:
+            w = int(self.canvas.winfo_width() or 0)
+            h = int(self.canvas.winfo_height() or 0)
+        except Exception:
+            w, h = 0, 0
+
+        if w <= 0 or h <= 0:
+            self._job = self.root.after(120, self._tick)
+            return
+
+        for f in list(self._flakes):
+            try:
+                f["y"] += float(f["vy"])
+                f["x"] += float(f["vx"])
+
+                r = float(f["r"])
+                if f["y"] > (h + r + 6):
+                    f["y"] = -r
+                    f["x"] = random.uniform(0, w)
+                    f["vy"] = random.uniform(0.7, 2.3) + (r * 0.25)
+                    f["vx"] = random.uniform(-0.35, 0.35)
+
+                if f["x"] < -r:
+                    f["x"] = w + r
+                elif f["x"] > (w + r):
+                    f["x"] = -r
+
+                self.canvas.coords(f["id"], f["x"] - r, f["y"] - r, f["x"] + r, f["y"] + r)
+            except Exception:
+                pass
+
+        self._job = self.root.after(33, self._tick)
+
 def slide_switch(frame_out: tk.Frame, frame_in: tk.Frame, root: tk.Tk, direction="right"):
-    frame_out.place_forget()
-    frame_in.place(relx=1.0 if direction == "right" else -1.0, rely=0, relwidth=1.0, relheight=1.0)
+    # Не делаем place_forget() у frame_out, иначе потом tkraise() не вернёт экран.
+    # Держим оба экрана "припаркованными" в layout, анимируем только frame_in.
+    try:
+        frame_out.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+    except Exception:
+        pass
+
+    start_x = 1.0 if direction == "right" else -1.0
+    frame_in.place(relx=start_x, rely=0, relwidth=1.0, relheight=1.0)
+    try:
+        frame_in.tkraise()
+    except Exception:
+        pass
 
     try:
         prev = getattr(root, "_slide_job", None)
@@ -1305,7 +2282,6 @@ def slide_switch(frame_out: tk.Frame, frame_in: tk.Frame, root: tk.Tk, direction
     except Exception:
         pass
 
-    start_x = 1.0 if direction == "right" else -1.0
     steps = 16
 
     def _step(i=0):
@@ -1381,6 +2357,12 @@ def style_entry(e):
         disabledforeground=SUBTEXT,
         readonlybackground=FIELD_BG_2,
     )
+    try:
+        if str(e.winfo_class()) == "Spinbox":
+            btn_bg = BG_CARD if CURRENT_THEME == "light" else _mix(FIELD_BG, SUBTEXT, 0.75)
+            e.config(buttonbackground=btn_bg, buttoncursor="hand2")
+    except Exception:
+        pass
 
 def style_text(t):
     _remember("texts", t)
@@ -1392,100 +2374,191 @@ def style_text(t):
              highlightthickness=th, highlightbackground=BORDER, highlightcolor=ACCENT_SECOND)
 
 
+class BusyOverlay:
+    def __init__(self, root: tk.Tk, message: str = "Загрузка…", *, title: str = "Загрузка", modal: bool = False):
+        self.root = root
+        self._old_cursor = None
 
+        win = tk.Toplevel(root)
+        self.win = win
+        try:
+            win.iconbitmap(get_app_icon())
+        except Exception:
+            pass
 
-# --- Новогодние снежинки (Canvas overlay) ---
-HOLIDAY_MODE = False  # по умолчанию выключено (выглядит дороже)
-# HOLIDAY_MODE = (datetime.now().month in (12, 1))  # если захочешь вернуть авто-режим
+        win.title(title)
+        win.transient(root)
+        win.resizable(False, False)
+        win.configure(bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
 
+        tk.Frame(win, bg=ACCENT, height=3).pack(fill="x")
+        body = tk.Frame(win, bg=BG_SURFACE)
+        body.pack(fill="both", expand=True, padx=16, pady=14)
 
-class SnowOverlay:
-    def __init__(self, canvas: tk.Canvas, flakes: int = 80, fps: int = 28, color: str = "#EAF6FF"):
-        self.canvas = canvas
-        self.flakes = []
-        self.color = color
-        self.fps_ms = max(15, int(1000 / max(10, fps)))
-        self.enabled = True
-        self._after_id = None
-        self._w = 1
-        self._h = 1
+        self.label = tk.Label(
+            body,
+            text=message,
+            bg=BG_SURFACE,
+            fg=TEXT,
+            font=("Segoe UI", 10),
+            wraplength=520,
+            justify="left",
+        )
+        self.label.pack(anchor="w")
 
-        self.canvas.bind("<Configure>", self._on_resize)
-        self._init_flakes(flakes)
+        self.pb = ttk.Progressbar(body, mode="indeterminate")
+        self.pb.pack(fill="x", pady=(10, 0))
+        try:
+            self.pb.start(10)
+        except Exception:
+            pass
 
-    def _on_resize(self, e):
-        self._w = max(1, e.width)
-        self._h = max(1, e.height)
+        try:
+            self._old_cursor = root.cget("cursor")
+            root.configure(cursor="watch")
+        except Exception:
+            pass
 
-    def _init_flakes(self, n: int):
-        self.canvas.delete("snow")
-        self.flakes.clear()
+        try:
+            win.update_idletasks()
+            scale = float(globals().get("UI_SCALE", 1.0) or 1.0)
+        except Exception:
+            scale = 1.0
+        scale = max(1.0, min(3.0, scale))
 
-        w = max(1, self.canvas.winfo_width() or 1)
-        h = max(1, self.canvas.winfo_height() or 1)
-        self._w, self._h = w, h
+        try:
+            w, h = int(540 * scale), int(130 * scale)
 
-        for _ in range(n):
-            r = random.choice([1, 2, 2, 3, 3, 4])
-            x = random.uniform(0, w)
-            y = random.uniform(0, h)
-            spd = random.uniform(0.8, 2.4) * (1 + r * 0.08)
-            drift = random.uniform(-0.6, 0.6)
-
-            oid = self.canvas.create_oval(
-                x - r, y - r, x + r, y + r,
-                fill=self.color, outline="",
-                tags=("snow",)
-            )
-            self.flakes.append([oid, x, y, r, spd, drift])
-
-    def start(self):
-        self.stop()
-        self.enabled = True
-        self._tick()
-
-    def stop(self):
-        if self._after_id is not None:
+            # Пытаемся центрировать относительно главного окна (если размеры адекватные),
+            # иначе — по центру экрана (чтобы не улетало в угол).
             try:
-                self.canvas.after_cancel(self._after_id)
+                root.update_idletasks()
             except Exception:
                 pass
-        self._after_id = None
 
-    def _tick(self):
-        if not self.enabled:
+            rw = rh = 0
+            rx = ry = 0
+            try:
+                rw = int(root.winfo_width())
+                rh = int(root.winfo_height())
+                rx = int(root.winfo_rootx())
+                ry = int(root.winfo_rooty())
+            except Exception:
+                rw = rh = 0
+                rx = ry = 0
+
+            sw = int(win.winfo_screenwidth())
+            sh = int(win.winfo_screenheight())
+
+            if rw >= 240 and rh >= 240:
+                x = rx + (rw - w) // 2
+                y = ry + (rh - h) // 2
+            else:
+                x = (sw - w) // 2
+                y = (sh - h) // 2
+
+            # clamp в пределах экрана (с небольшими отступами)
+            x = max(10, min(int(x), sw - w - 10))
+            y = max(10, min(int(y), sh - h - 10))
+            win.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+        if modal:
+            try:
+                win.grab_set()
+            except Exception:
+                pass
+
+        try:
+            win.lift()
+            win.attributes("-topmost", True)
+            win.after(200, lambda: win.attributes("-topmost", False))
+        except Exception:
+            pass
+
+    def set_message(self, message: str):
+        def _do():
+            try:
+                if self.label.winfo_exists():
+                    self.label.config(text=message)
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _do)
+        except Exception:
+            _do()
+
+    def close(self):
+        def _do():
+            try:
+                self.pb.stop()
+            except Exception:
+                pass
+            try:
+                if self.win.winfo_exists():
+                    self.win.destroy()
+            except Exception:
+                pass
+            try:
+                self.root.configure(cursor=(self._old_cursor or ""))
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _do)
+        except Exception:
+            _do()
+
+
+def run_async(
+    root: tk.Tk,
+    task,
+    *,
+    title: str = "Загрузка",
+    message: str = "Загрузка…",
+    modal: bool = False,
+    on_done=None,
+    on_error=None,
+):
+    """
+    Запускает task(busy) в фоне и показывает индикатор занятости.
+    ВНИМАНИЕ: task НЕ должен трогать tkinter напрямую (только через busy.set_message/root.after).
+    """
+    busy = BusyOverlay(root, message, title=title, modal=modal)
+
+    def _worker():
+        try:
+            result = task(busy)
+        except Exception as e:
+            def _err():
+                try:
+                    if on_error:
+                        on_error(e, busy)
+                    else:
+                        messagebox.showerror("Ошибка", str(e))
+                finally:
+                    busy.close()
+            try:
+                root.after(0, _err)
+            except Exception:
+                _err()
             return
 
-        # если экран не виден (frame place_forget), не жжём CPU
-        if not self.canvas.winfo_ismapped():
-            self._after_id = self.canvas.after(300, self._tick)
-            return
+        def _ok():
+            if on_done:
+                on_done(result, busy)
+            else:
+                busy.close()
+        try:
+            root.after(0, _ok)
+        except Exception:
+            _ok()
 
-        w = self.canvas.winfo_width()
-        h = self.canvas.winfo_height()
-        if w > 1: self._w = w
-        if h > 1: self._h = h
+    threading.Thread(target=_worker, daemon=True).start()
+    return busy
 
-        for fl in self.flakes:
-            oid, x, y, r, spd, drift = fl
 
-            x += drift + random.uniform(-0.15, 0.15)
-            y += spd
-
-            if y - r > self._h:
-                y = -random.uniform(10, 120)
-                x = random.uniform(0, self._w)
-                spd = random.uniform(0.8, 2.4) * (1 + r * 0.08)
-                drift = random.uniform(-0.6, 0.6)
-
-            if x < -10: x = self._w + 10
-            if x > self._w + 10: x = -10
-
-            self.canvas.coords(oid, x - r, y - r, x + r, y + r)
-
-            fl[1], fl[2], fl[4], fl[5] = x, y, spd, drift
-
-        self._after_id = self.canvas.after(self.fps_ms, self._tick)
 def pill(parent, text, color):
     f = tk.Frame(parent, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
     lbl = tk.Label(f, text=text, bg=BG_CARD, fg=color, font=("Segoe UI Semibold", 9))
@@ -1614,21 +2687,79 @@ def render_page(frame, canvas, page_label, nav_frame, update_copy_button_text):
 
 def search_by_year(year, frame, canvas, count_label, page_label, nav_frame, update_copy_button_text):
     global found_files, checked_vars, current_page
+    y = str(year).strip()
     found_files, checked_vars = [], []
-    seen = set()
-    for name, path in movie_index:
-        if f"({year})" in name:
-            base = normalize_name(name)
-            if base in seen: continue
-            seen.add(base)
-            found_files.append((name, path))
-            checked_vars.append(tk.BooleanVar(value=False))
 
-    count_label.config(text=f"Найдено фильмов: {len(found_files)}", fg=ACCENT_SECOND, bg=BG_WINDOW)
-    if not found_files:
-        messagebox.showinfo("Результат", f"Фильмы за {year} не найдены"); return
-    current_page = 1
-    render_page(frame, canvas, page_label, nav_frame, update_copy_button_text)
+    try:
+        count_label.config(text=f"⏳ Поиск фильмов за {y}…", fg=ACCENT_SECOND, bg=BG_WINDOW)
+    except Exception:
+        pass
+
+    def _task(busy: BusyOverlay):
+        busy.set_message(f"⏳ Поиск по году {y}…")
+        token = f"({y})"
+        res = []
+        seen = set()
+        for name, path in movie_index:
+            try:
+                ext = os.path.splitext(name)[1].lower()
+            except Exception:
+                ext = ""
+            # В индексе есть и метафайлы (постеры/clearlogo/nfo и т.п.) — в поиске по году показываем только видео.
+            if ext not in VIDEO_EXTENSIONS:
+                continue
+            if token in name:
+                base = normalize_name(name)
+                if base in seen:
+                    continue
+                seen.add(base)
+                res.append((name, path))
+        return res
+
+    def _done(res, busy: BusyOverlay):
+        global found_files, checked_vars, current_page
+        found_files = res
+        checked_vars = [tk.BooleanVar(value=False) for _ in found_files]
+
+        try:
+            count_label.config(text=f"Найдено фильмов: {len(found_files)}", fg=ACCENT_SECOND, bg=BG_WINDOW)
+        except Exception:
+            pass
+
+        if not found_files:
+            messagebox.showinfo("Результат", f"Фильмы за {y} не найдены")
+            busy.close()
+            return
+
+        current_page = 1
+        render_page(frame, canvas, page_label, nav_frame, update_copy_button_text)
+        busy.close()
+
+    def _err(e: Exception, _busy: BusyOverlay):
+        try:
+            count_label.config(text="❌ Ошибка поиска", fg=ERROR, bg=BG_WINDOW)
+        except Exception:
+            pass
+        messagebox.showerror("Ошибка", f"Ошибка при поиске:\n{e}")
+
+    try:
+        r = globals().get("root")
+    except Exception:
+        r = None
+
+    if r is None:
+        messagebox.showerror("Ошибка", "Не найден корневой окно приложения (root).")
+        return
+
+    run_async(
+        r,
+        _task,
+        title="Поиск по году",
+        message=f"⏳ Поиск фильмов за {y}…",
+        modal=False,
+        on_done=_done,
+        on_error=_err,
+    )
 
 def copy_selected(root):
     if not found_files:
@@ -1700,6 +2831,12 @@ def show_screen(screens: dict[str, tk.Frame], name: str):
     f = screens.get(name)
     if not f:
         return
+    # Защита: если какой-то экран был спрятан через place_forget(),
+    # tkraise() сам по себе его не покажет. Возвращаем экран в layout перед поднятием.
+    try:
+        f.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+    except Exception:
+        pass
     f.tkraise()
 def _set_bg_recursive(w, bg):
     try:
@@ -1722,26 +2859,46 @@ def main():
     
     s = load_settings()
     try:
+        root._kino_auto_convert_all_audio = bool(s.get("kino_auto_convert_all_audio", False))
+    except Exception:
+        pass
+    try:
+        v = int(s.get("kino_audio_parallel_tracks", 1) or 1)
+    except Exception:
+        v = 1
+    try:
+        root._kino_audio_parallel_tracks = max(1, min(4, int(v)))
+    except Exception:
+        root._kino_audio_parallel_tracks = 1
+    try:
         if bool(s.get("start_minimized_to_tray", False)):
             # Старт в трее отключили: приложение всегда запускается развернутым в панели задач.
             s["start_minimized_to_tray"] = False
             save_settings(s)
     except Exception:
         pass
+
+    try:
+        root._holiday_theme = _is_holiday_season()
+    except Exception:
+        root._holiday_theme = False
+
     theme_name = s.get("theme", "dark")
     try:
         set_hls_reencode(bool(s.get("hls_reencode", True)))
     except Exception:
         pass
 
-    _apply_globals_from_theme(theme_name)   # только это
-    root.configure(bg=BG_WINDOW)
-
-    apply_ttk_theme()  # чтобы ttk сразу был в нужной теме
+    apply_theme(root, theme_name)
 
     root.title("Movie Tools")
-    try: root.iconbitmap(get_app_icon())
-    except Exception: logging.info("icon.ico not found, using default icon")
+    try:
+        root.iconbitmap(default=get_app_icon())
+    except Exception:
+        try:
+            root.iconbitmap(get_app_icon())
+        except Exception:
+            logging.info("icon.ico not found, using default icon")
 
 
     root.geometry("1000x680")
@@ -1775,10 +2932,40 @@ def main():
     # --- Шапка ---
     appbar = tk.Frame(root, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
     appbar.pack(side="top", fill="x")
-    tk.Label(appbar, text="Movie Tools", bg=BG_SURFACE, fg=ACCENT,
-         font=("Segoe UI Semibold", 20)).pack(side="left", padx=16, pady=10)
+    title_lbl = tk.Label(appbar, text="Movie Tools", bg=BG_SURFACE, fg=ACCENT,
+         font=("Segoe UI Semibold", 20))
+    title_lbl.pack(side="left", padx=16, pady=10)
+
+    # Снеговик в шапке (показываем только в новогодней теме)
+    snowman_lbl = tk.Label(appbar, text="⛄", bg=BG_SURFACE, fg=TEXT, font=("Segoe UI Emoji", 18))
+    try:
+        root._snowman_label = snowman_lbl
+        if bool(getattr(root, "_holiday_theme", False)):
+            snowman_lbl.pack(side="left", padx=(6, 0), pady=10)
+    except Exception:
+        pass
     right_appbar = tk.Frame(appbar, bg=BG_SURFACE)
     right_appbar.pack(side="right", padx=12, pady=8)
+
+    # Новогодний "снежок": всегда рисуем полоску под шапкой,
+    # а если поддерживается — ещё и overlay по всему окну (Windows).
+    try:
+        try:
+            scale = float(globals().get("UI_SCALE", 1.0) or 1.0)
+        except Exception:
+            scale = 1.0
+        root._snow_strip = SnowStrip(root, after_widget=appbar, height=int(28 * max(1.0, min(3.0, scale))))
+        root._snow_strip.set_enabled(bool(getattr(root, "_holiday_theme", False)))
+    except Exception:
+        pass
+
+    try:
+        root._snow_overlay = SnowOverlay(root)
+        root._snow_overlay.set_enabled(bool(getattr(root, "_holiday_theme", False)))
+    except Exception:
+        # overlay может быть недоступен (например, прозрачность не поддерживается)
+        root._snow_overlay = None
+
     _anim_job = {"id": None}
 
     def animate_nav_indicator(target_item: tk.Widget):
@@ -2303,17 +3490,16 @@ def main():
     # ========== Finder ==========
     commandbar = tk.Frame(finder, bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
     commandbar.pack(side="top", fill="x", pady=(0, 6))
-    tk.Label(commandbar, text="🎞 MOVIE YEAR FINDER", bg=BG_SURFACE, fg=ACCENT_SECOND,
+    tk.Label(commandbar, text="🎞 Поиск фильмов по году в медиатеке", bg=BG_SURFACE, fg=ACCENT_SECOND,
              font=("Segoe UI Semibold", 16)).pack(side="left", padx=12, pady=8)
 
     right_controls = tk.Frame(commandbar, bg=BG_SURFACE); right_controls.pack(side="right", padx=12, pady=8)
-    btn_export = tk.Button(right_controls, text="Проверить NAS")
-    style_secondary(btn_export)
-    btn_export.pack(side="left", padx=(0, 10))
     tk.Label(right_controls, text="Год:", bg=BG_SURFACE, fg=SUBTEXT, font=("Segoe UI", 11)).pack(side="left")
     year_entry = tk.Entry(right_controls, font=("Segoe UI", 11), width=8, state="disabled",
                           bg=FIELD_BG, fg=TEXT, insertbackground=TEXT, relief="flat")
     year_entry.pack(side="left", padx=(6, 8))
+    # Enter в поле года запускает поиск (и не пробрасывается на другие обработчики)
+    year_entry.bind("<Return>", lambda e: (on_search() or "break"))
     btn_find_year = tk.Button(right_controls, text="Найти", state="disabled")
     style_secondary(btn_find_year)
     btn_find_year.pack(side="left")
@@ -2369,26 +3555,32 @@ def main():
         """Экспорт Everything -> all_movies.efu -> загрузка в movie_index."""
         global movie_index, index_loaded
 
+        # Собираем запрос для Everything по нужным расширениям (видео + мета)
+        exts = set(VIDEO_EXTENSIONS) | set(META_EXTENSIONS)
+        query = "|".join([f"ext:{e.lstrip('.')}" for e in sorted(exts)])
+        cmd = ["es.exe", query, "-n", "9999999", "-export-efu", EFU_FILE]
+
         try:
-            # Собираем запрос для Everything по нужным расширениям
-            # (видео + мета)
-            exts = set(VIDEO_EXTENSIONS) | set(META_EXTENSIONS)
-            query = "|".join([f"ext:{e.lstrip('.')}" for e in sorted(exts)])
+            count_label.config(text="⏳ Индексация NAS... подождите", fg=ACCENT_SECOND)
+        except Exception:
+            pass
 
-            cmd = ["es.exe", query, "-n", "9999999", "-export-efu", EFU_FILE]
+        try:
+            btn_nas.config(state="disabled")
+        except Exception:
+            pass
 
-            # Можно подсветить статус, если хочешь
-            try:
-                count_label.config(text="⏳ Индексация NAS... подождите", fg=ACCENT_SECOND)
-            except Exception:
-                pass
-
+        def _task(busy: BusyOverlay):
+            busy.set_message("⏳ Индексация NAS...")
             subprocess.run(cmd, check=True)
+            return load_index_from_efu(EFU_FILE)
 
-            movie_index = load_index_from_efu(EFU_FILE)
+        def _done(idx, busy: BusyOverlay):
+            global movie_index, index_loaded
+            movie_index = idx
             index_loaded = True
             update_sidebar_status()
-            # включаем поиск по году
+
             year_entry.config(state="normal")
             btn_find_year.config(state="normal")
 
@@ -2397,20 +3589,56 @@ def main():
             except Exception:
                 pass
 
-            messagebox.showinfo("Индекс", f"✅ Загружено файлов: {len(movie_index)}\nФайл: {EFU_FILE}")
+            try:
+                messagebox.showinfo("Индекс", f"✅ Загружено файлов: {len(movie_index)}\nФайл: {EFU_FILE}")
+            except Exception:
+                pass
 
-        except FileNotFoundError:
-            messagebox.showerror(
-                "Ошибка",
-                "Не найден es.exe (Everything CLI).\n\n"
-                "Положи es.exe рядом с программой или добавь Everything в PATH."
-            )
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Ошибка", f"Everything (es.exe) завершился с ошибкой:\n{e}")
-        except Exception as e:
+            try:
+                btn_nas.config(state="normal")
+            except Exception:
+                pass
+
+            busy.close()
+
+        def _err(e: Exception, _busy: BusyOverlay):
+            global index_loaded
+            index_loaded = False
+
+            try:
+                btn_nas.config(state="normal")
+            except Exception:
+                pass
+
+            try:
+                count_label.config(text="❌ Ошибка индексации NAS", fg=ERROR)
+            except Exception:
+                pass
+
+            if isinstance(e, FileNotFoundError):
+                messagebox.showerror(
+                    "Ошибка",
+                    "Не найден es.exe (Everything CLI).\n\n"
+                    "Положи es.exe рядом с программой или добавь Everything в PATH."
+                )
+                return
+
+            if isinstance(e, subprocess.CalledProcessError):
+                messagebox.showerror("Ошибка", f"Everything (es.exe) завершился с ошибкой:\n{e}")
+                return
+
             messagebox.showerror("Ошибка", f"Не удалось подготовить индекс:\n{e}")
 
-    btn_export.config(command=prepare_index)
+        run_async(
+            root,
+            _task,
+            title="Проверка NAS",
+            message="⏳ Индексация NAS...",
+            modal=False,
+            on_done=_done,
+            on_error=_err,
+        )
+
     btn_find_year.config(command=on_search)
     btn_copy.config(command=lambda: copy_selected(root))
 
@@ -2422,12 +3650,6 @@ def main():
     canvas.bind_all("<Button-4>", _on_mousewheel)
     canvas.bind_all("<Button-5>", _on_mousewheel)
     root.bind("<Control-a>", lambda e: toggle_select_all())
-    def on_key_return(event):
-        if finder.winfo_ismapped():
-            on_search()
-        elif kino_search.winfo_ismapped():
-            search_one_title()
-    root.bind("<Return>", on_key_return)
 
     if START_FULLSCREEN:
         # Esc — выйти из полноэкранного; F11 — вернуть
@@ -2463,15 +3685,128 @@ def main():
             if not messagebox.askyesno("Сброс профиля", msg):
                 return False
 
+        def _norm(p: str) -> str:
+            return (p or "").replace("\\", "/").lower()
+
+        def _kill_leftovers() -> int:
+            """
+            Если приложение ранее падало, могли остаться процессы Chromium/undetected_chromedriver,
+            которые блокируют удаление профиля. Здесь пытаемся их завершить.
+            """
+            if os.name != "nt":
+                return 0
+            try:
+                import psutil  # type: ignore
+            except Exception:
+                return 0
+
+            base_ref = _norm(media_profile)
+            uc_ref = _norm(uc_profile)
+
+            procs = {}
+            for p in psutil.process_iter(["pid", "exe", "cmdline"]):
+                try:
+                    pid = int(p.info.get("pid") or 0)
+                    if not pid:
+                        continue
+                    exe = _norm(p.info.get("exe") or "")
+                    cl = _norm(" ".join(p.info.get("cmdline") or []))
+
+                    # 1) сам undetected_chromedriver.exe из Roaming\undetected_chromedriver
+                    if uc_ref and exe.startswith(uc_ref + "/"):
+                        procs[pid] = p
+                        continue
+
+                    # 2) Chromium, запущенный с --user-data-dir внутри LocalAppData\MediaSearch\...
+                    if base_ref and ("--user-data-dir=" in cl) and (base_ref in cl):
+                        procs[pid] = p
+                except Exception:
+                    pass
+
+            if not procs:
+                return 0
+
+            plist = list(procs.values())
+            for p in plist:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+            try:
+                _, alive = psutil.wait_procs(plist, timeout=1.5)
+            except Exception:
+                alive = []
+
+            for p in alive:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+            try:
+                psutil.wait_procs(alive, timeout=1.0)
+            except Exception:
+                pass
+
+            return len(plist)
+
+        def _rmtree_force(path: str):
+            def _onerror(func, p, _exc_info):
+                try:
+                    os.chmod(p, 0o700)
+                except Exception:
+                    pass
+                try:
+                    func(p)
+                except Exception:
+                    pass
+
+            shutil.rmtree(path, onerror=_onerror)
+
+        # Сначала пробуем прибрать "висячие" процессы, чтобы rmtree не падал с AccessDenied.
+        try:
+            killed = _kill_leftovers()
+            if killed:
+                logging.info("Purge: terminated %d leftover UC/Chromium processes", killed)
+        except Exception:
+            pass
+
         removed_any = False
         for path in targets:
-            try:
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
+            if not os.path.isdir(path):
+                continue
+            last_err = None
+            for attempt in range(2):
+                try:
+                    _rmtree_force(path)
                     removed_any = True
                     logging.info("Удалена папка профиля: %s", path)
-            except Exception as e:
-                logging.error("Ошибка удаления профиля %s: %s", path, e)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    logging.error("Ошибка удаления профиля %s (attempt %s): %s", path, attempt + 1, e)
+                    # 1-я попытка могла упасть из-за "висячих" процессов -> пробуем закрыть и повторить
+                    try:
+                        _kill_leftovers()
+                    except Exception:
+                        pass
+                    try:
+                        time.sleep(0.2)
+                    except Exception:
+                        pass
+
+            if last_err is not None and silent:
+                try:
+                    push_notification(
+                        "⚠ Kino.pub",
+                        "Не удалось очистить профиль (папка занята процессом). "
+                        "Закройте оставшиеся chrome.exe/undetected_chromedriver.exe и повторите.",
+                        unread=True,
+                    )
+                except Exception:
+                    pass
 
         if (not silent) and removed_any:
             messagebox.showinfo(
@@ -2565,9 +3900,15 @@ def main():
     req_body = tk.Frame(requests, bg=BG_WINDOW)
     req_body.pack(fill="both", expand=True, padx=10, pady=8)
 
-    # правая колонка в 2 раза шире левой
-    req_body.columnconfigure(0, weight=1)
-    req_body.columnconfigure(1, weight=2)
+    # Левая колонка фиксированная (ввод), правая — максимально широкая (результаты)
+    try:
+        _req_scale = float(globals().get("UI_SCALE", 1.0) or 1.0)
+    except Exception:
+        _req_scale = 1.0
+    _req_scale = max(1.0, min(3.0, _req_scale))
+
+    req_body.columnconfigure(0, weight=0, minsize=int(320 * _req_scale))
+    req_body.columnconfigure(1, weight=1)
     req_body.rowconfigure(0, weight=1)
 
     # Левая часть: ввод списка
@@ -2731,12 +4072,18 @@ def main():
     req_tree.heading("path",        text="Путь",             anchor="w")
     req_tree.heading("paths_btn",   text="",                 anchor="center")
 
-    req_tree.column("sel",         width=24,  anchor="center", stretch=False)
-    req_tree.column("req_title",   width=150, anchor="w")
-    req_tree.column("status",      width=120, anchor="center")
-    req_tree.column("found_title", width=220, anchor="w")
-    req_tree.column("path",        width=520, anchor="w")
-    req_tree.column("paths_btn",   width=26,  anchor="center", stretch=False)
+    try:
+        _scale = float(globals().get("UI_SCALE", 1.0) or 1.0)
+    except Exception:
+        _scale = 1.0
+    _scale = max(1.0, min(3.0, _scale))
+
+    req_tree.column("sel",         width=int(26 * _scale), minwidth=int(24 * _scale), anchor="center", stretch=False)
+    req_tree.column("req_title",   width=int(260 * _scale), minwidth=int(160 * _scale), anchor="w", stretch=True)
+    req_tree.column("status",      width=int(160 * _scale), minwidth=int(130 * _scale), anchor="center", stretch=False)
+    req_tree.column("found_title", width=int(280 * _scale), minwidth=int(200 * _scale), anchor="w", stretch=True)
+    req_tree.column("path",        width=int(520 * _scale), minwidth=int(260 * _scale), anchor="w", stretch=True)
+    req_tree.column("paths_btn",   width=int(30 * _scale), minwidth=int(26 * _scale), anchor="center", stretch=False)
 
     req_tree.pack(fill="both", expand=True)
 
@@ -2783,7 +4130,7 @@ def main():
         popup = tk.Toplevel(root)
         popup.title("Варианты путей")
         try:
-            popup.iconbitmap("icon.ico")
+            popup.iconbitmap(get_app_icon())
         except Exception:
             pass
 
@@ -3100,7 +4447,7 @@ def main():
         if not index_loaded:
             messagebox.showerror(
                 "Ошибка",
-                "Сначала проверь данные на NAS (кнопка «Проверить NAS»).",
+                "Сначала проверь данные на NAS (внизу слева: NAS → «Проверить»).",
             )
             return
 
@@ -3269,7 +4616,7 @@ def main():
         progress_win = tk.Toplevel(root)
         progress_win.title("Копирование")
         try:
-            progress_win.iconbitmap("icon.ico")
+            progress_win.iconbitmap(get_app_icon())
         except Exception:
             pass
 
@@ -3406,7 +4753,7 @@ def main():
                 if len(vals) >= 3:
                     status = str(vals[2]).strip().lower()
                     # всё, что НЕ начинается с "найдено" — считаем «не найденным»
-                    if not status.startswith("найдено"):
+                    if "нет в медиатеке" in status:
                         items.append(item)
 
             if not items:
@@ -3472,6 +4819,12 @@ def main():
 
         # 4а) Если есть сохранённые URL — ведём себя как раньше
         if used_urls:
+            try:
+                _active[0] = "kino"
+                set_nav_active(nav_items, "kino")
+                animate_nav_indicator(nav_items["kino"])
+            except Exception:
+                pass
             slide_switch(requests, kino_search, root, "right")
             return
 
@@ -3489,6 +4842,12 @@ def main():
 
             # стандартный поиск по списку
             search_by_list()
+            try:
+                _active[0] = "kino"
+                set_nav_active(nav_items, "kino")
+                animate_nav_indicator(nav_items["kino"])
+            except Exception:
+                pass
             slide_switch(requests, kino_search, root, "right")
             return
 
@@ -3601,6 +4960,10 @@ def main():
     style_secondary(btn_download)          # тот же стиль, что и у "Выбрать"
     btn_download.pack(side="left", padx=(8, 0), ipady=2)
 
+    btn_download_series = tk.Button(input_row, text="📺 Сериал")
+    style_secondary(btn_download_series)
+    btn_download_series.pack(side="left", padx=(8, 0), ipady=2)
+
 
     path_frame = tk.Frame(top_part, bg=BG_SURFACE); path_frame.pack(fill="x", padx=40, pady=(10, 8))
     tk.Label(path_frame, text="📂 Папка сохранения:", bg=BG_SURFACE, fg=SUBTEXT,
@@ -3668,19 +5031,174 @@ def main():
     queue_part = tk.Frame(dl_right, bg=BG_SURFACE); queue_part.pack(fill="both", expand=True, padx=36, pady=(8, 12))
 
     from tkinter import ttk
+    queue_toolbar = tk.Frame(queue_part, bg=BG_SURFACE)
+    queue_toolbar.pack(fill="x", pady=(0, 6))
+
+    btn_cancel_all = tk.Button(queue_toolbar, text="⛔ Отменить всё")
+    style_secondary(btn_cancel_all)
+    btn_cancel_all.pack(side="left", padx=4)
+
+    btn_clear_all = tk.Button(queue_toolbar, text="🧹 Убрать всё")
+    style_secondary(btn_clear_all)
+    btn_clear_all.pack(side="left", padx=4)
+
+    btn_clear_done = tk.Button(queue_toolbar, text="✅ Убрать готовые")
+    style_secondary(btn_clear_done)
+    btn_clear_done.pack(side="left", padx=4)
+
+    btn_pause = tk.Button(queue_toolbar, text="⏸ Пауза")
+    style_secondary(btn_pause)
+    btn_pause.pack(side="left", padx=(16, 4))
+
+    btn_resume = tk.Button(queue_toolbar, text="▶ Возобновить")
+    style_secondary(btn_resume)
+    btn_resume.pack(side="left", padx=4)
+
+    btn_resume_all = tk.Button(queue_toolbar, text="▶ Возобновить всё")
+    style_secondary(btn_resume_all)
+    btn_resume_all.pack(side="left", padx=4)
+
+    btn_convert = tk.Button(queue_toolbar, text="🎞 Конвертировать")
+    style_secondary(btn_convert)
+    btn_convert.pack(side="left", padx=4)
+    try:
+        btn_convert.config(state="disabled")
+    except Exception:
+        pass
+
     table_frame = tk.Frame(queue_part, bg=BG_SURFACE); table_frame.pack(fill="both", expand=True, pady=(4, 6))
     scrollbar = ttk.Scrollbar(table_frame); scrollbar.pack(side="right", fill="y")
     columns = ("#", "title", "status")
-    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=6, yscrollcommand=scrollbar.set)
+    tree = ttk.Treeview(
+        table_frame,
+        columns=columns,
+        show="tree headings",
+        height=6,
+        yscrollcommand=scrollbar.set,
+        style="KinoQueue.Treeview",
+    )
     # ========== ПКМ МЕНЮ ДЛЯ ПОВТОРА ==========
         # ========== ПКМ МЕНЮ ДЛЯ ПОВТОРА / ПЕРЕЗАПУСКА ==========
     context_menu = tk.Menu(root, tearoff=0)
     register_menu(context_menu)
 
+    def _top_item(iid: str) -> str:
+        try:
+            p = tree.parent(iid)
+            while p:
+                iid = p
+                p = tree.parent(iid)
+        except Exception:
+            pass
+        return iid
+
+    _drag_state = {"iid": None, "y": 0, "moved": False}
+
+    def _drag_start(event):
+        try:
+            region = str(tree.identify_region(event.x, event.y) or "")
+        except Exception:
+            region = ""
+        if region not in ("cell", "tree"):
+            _drag_state["iid"] = None
+            return
+        iid = tree.identify_row(event.y)
+        if not iid:
+            _drag_state["iid"] = None
+            return
+        iid = _top_item(iid)
+        try:
+            if tree.parent(iid):
+                iid = _top_item(iid)
+        except Exception:
+            pass
+        _drag_state["iid"] = iid
+        _drag_state["y"] = int(event.y)
+        _drag_state["moved"] = False
+        try:
+            tree.selection_set(iid)
+        except Exception:
+            pass
+
+    def _drag_motion(event):
+        iid = _drag_state.get("iid")
+        if not iid:
+            return
+        try:
+            dy = abs(int(event.y) - int(_drag_state.get("y") or 0))
+        except Exception:
+            dy = 0
+        if dy < 6 and not _drag_state.get("moved"):
+            return
+
+        target = tree.identify_row(event.y)
+        if not target:
+            return
+        target = _top_item(target)
+        if not target or target == iid:
+            return
+
+        try:
+            new_index = int(tree.index(target))
+        except Exception:
+            return
+
+        try:
+            cur_index = int(tree.index(iid))
+        except Exception:
+            cur_index = None
+
+        if cur_index == new_index:
+            return
+
+        try:
+            tree.move(iid, "", new_index)
+            _drag_state["moved"] = True
+        except Exception:
+            return
+
+    def _drag_end(_event):
+        iid = _drag_state.get("iid")
+        moved = bool(_drag_state.get("moved"))
+        _drag_state["iid"] = None
+        _drag_state["moved"] = False
+        if not iid or not moved:
+            return
+
+        try:
+            reindex_rows()
+        except Exception:
+            pass
+
+        try:
+            cb = getattr(manager, "reschedule_pending", None)
+            if callable(cb):
+                cb()
+        except Exception:
+            pass
+
+        try:
+            _schedule_kino_queue_save(0)
+        except Exception:
+            pass
+
+        try:
+            tree.selection_set(iid)
+        except Exception:
+            pass
+
+    # drag&drop reorder (не ломает стандартный выбор строк)
+    try:
+        tree.bind("<ButtonPress-1>", _drag_start, add="+")
+        tree.bind("<B1-Motion>", _drag_motion, add="+")
+        tree.bind("<ButtonRelease-1>", _drag_end, add="+")
+    except Exception:
+        pass
+
     def retry_selected():
         """Перезапустить выделенный элемент с самого начала, в любом состоянии."""
         try:
-            item = tree.selection()[0]
+            item = _top_item(tree.selection()[0])
         except Exception:
             return
 
@@ -3690,8 +5208,162 @@ def main():
         # Сбрасываем статус и запускаем заново
         tree.set(item, "status", "🟡 Подготовка...")
         out_dir = _get_out_dir()
-        manager.start_item(item, url, out_dir)
+        item_out_dir = None
+        try:
+            op = getattr(manager, "out_path_by_item", {}).get(item)
+            if op:
+                item_out_dir = os.path.dirname(os.path.normpath(str(op)))
+        except Exception:
+            item_out_dir = None
+        try:
+            if (not item_out_dir) and getattr(manager, "out_dir_by_item", {}).get(item):
+                item_out_dir = str(getattr(manager, "out_dir_by_item", {}).get(item))
+        except Exception:
+            pass
+        if not item_out_dir:
+            item_out_dir = out_dir
+        manager.start_item(item, url, item_out_dir)
+
+    def retry_mux_selected():
+        """Повторить только MUX (если остались {out_path}.parts после ошибки ffmpeg)."""
+        try:
+            item = _top_item(tree.selection()[0])
+        except Exception:
+            return
+
+        try:
+            out_path = getattr(manager, "out_path_by_item", {}).get(item)
+        except Exception:
+            out_path = None
+
+        if not out_path:
+            messagebox.showerror("Ошибка", "Не удалось определить файл для MUX.\nПовторите загрузку целиком.")
+            return
+
+        parts_dir = out_path + ".parts"
+        if not os.path.isdir(parts_dir):
+            messagebox.showerror(
+                "Ошибка",
+                "Нет папки .parts для MUX.\nНечего муксовать — нужно скачать заново.",
+            )
+            return
+
+        try:
+            display_name = str(tree.set(item, "title") or "")
+        except Exception:
+            display_name = os.path.basename(out_path)
+
+        ev = getattr(manager, "cancel_events", {}).get(item)
+        if ev is None:
+            ev = threading.Event()
+            try:
+                manager.cancel_events[item] = ev
+            except Exception:
+                pass
+        else:
+            try:
+                ev.clear()
+            except Exception:
+                pass
+
+        try:
+            manager.final_status.pop(item, None)
+        except Exception:
+            pass
+
+        manager.set_status(item, "🟣 MUX…")
+
+        def _task():
+            try:
+                try:
+                    auto_convert = bool(getattr(root, "_kino_auto_convert_all_audio", False))
+                except Exception:
+                    auto_convert = False
+
+                def _audio_select_proxy(**kwargs):
+                    cb = getattr(manager, "audio_select_cb", None)
+                    if not callable(cb):
+                        return None
+                    return cb(item_id=item, **kwargs)
+
+                def _cb(msg):
+                    try:
+                        t = str(msg or "")
+                    except Exception:
+                        return
+                    if t.startswith("🔀 MUX"):
+                        manager.set_status(item, t)
+                    elif t.startswith("🎧"):
+                        manager.set_status(item, t)
+                    elif t.startswith("🟣"):
+                        manager.set_status(item, "🟣 MUX…")
+                    elif t.startswith("✅"):
+                        manager.set_status(item, "✅ Готово")
+                    elif t.startswith("❌") or ("Ошибка" in t):
+                        manager.set_status(item, "❌ Ошибка MUX")
+
+                result = hls_retry_mux(
+                    out_path,
+                    status_cb=_cb,
+                    cancel_event=ev,
+                    audio_select_cb=(None if auto_convert else _audio_select_proxy),
+                )
+                if getattr(ev, "is_set", lambda: False)():
+                    return
+                if result == "cancel":
+                    manager.set_status(item, "🎞 Готово к конвертации")
+                    return
+                if result:
+                    try:
+                        manager.final_status[item] = "✅"
+                    except Exception:
+                        pass
+                    manager.set_status(item, "✅ Готово")
+                    try:
+                        manager._notify("✅ Kino.pub", f"Готово (MUX): {display_name}")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        manager.final_status[item] = "❌"
+                    except Exception:
+                        pass
+                    manager.set_status(item, "❌ Ошибка MUX")
+            except Exception as e:
+                if getattr(ev, "is_set", lambda: False)():
+                    return
+                try:
+                    manager.final_status[item] = "❌"
+                except Exception:
+                    pass
+                manager.set_status(item, f"❌ {e}")
+
+        threading.Thread(target=_task, daemon=True).start()
     
+
+    def convert_selected():
+        """Запустить стадию MUX вручную (для статуса «🎞 Готово к конвертации» или после ошибки MUX)."""
+        try:
+            item = _top_item(tree.selection()[0])
+        except Exception:
+            return
+
+        try:
+            s = str(tree.set(item, "status") or "")
+        except Exception:
+            s = ""
+
+        if not (s.startswith("🎞") or ("Ошибка MUX" in s) or s.startswith("❌ Ошибка MUX")):
+            try:
+                messagebox.showinfo(
+                    "Kino.pub",
+                    "Сначала дождитесь окончания загрузки — появится статус «🎞 Готово к конвертации».",
+                )
+            except Exception:
+                pass
+            return
+
+        retry_mux_selected()
 
     def open_download_dir():
         out_dir = _get_out_dir(create=True)
@@ -3708,11 +5380,123 @@ def main():
             except Exception:
                 pass
 
+    def pause_selected():
+        sel = tree.selection()
+        if not sel:
+            return
+        targets = []
+        try:
+            targets = sorted({_top_item(i) for i in sel if i})
+        except Exception:
+            targets = list(sel)
+        for iid in targets:
+            try:
+                manager.pause_item(iid)
+            except Exception:
+                pass
+        try:
+            _schedule_kino_queue_save()
+        except Exception:
+            pass
+
+    def resume_selected():
+        sel = tree.selection()
+        if not sel:
+            return
+        targets = []
+        try:
+            targets = sorted({_top_item(i) for i in sel if i})
+        except Exception:
+            targets = list(sel)
+
+        out_dir = _get_out_dir()
+        for iid in targets:
+            try:
+                s = str(tree.set(iid, "status") or "")
+            except Exception:
+                s = ""
+            if s.startswith(("✅", "❌", "⛔", "🎞")):
+                continue
+
+            url = manager.url_by_item.get(iid) or tree.set(iid, "title")
+
+            item_out_dir = None
+            try:
+                op = getattr(manager, "out_path_by_item", {}).get(iid)
+                if op:
+                    item_out_dir = os.path.dirname(os.path.normpath(str(op)))
+            except Exception:
+                item_out_dir = None
+            try:
+                if (not item_out_dir) and getattr(manager, "out_dir_by_item", {}).get(iid):
+                    item_out_dir = str(getattr(manager, "out_dir_by_item", {}).get(iid))
+            except Exception:
+                pass
+            if not item_out_dir:
+                item_out_dir = out_dir
+
+            try:
+                manager.start_item(iid, url, item_out_dir)
+            except Exception:
+                pass
+
+        try:
+            _schedule_kino_queue_save()
+        except Exception:
+            pass
+
+    def resume_all():
+        items = list(tree.get_children(""))
+        if not items:
+            return
+
+        out_dir = _get_out_dir()
+        for iid in items:
+            try:
+                s = str(tree.set(iid, "status") or "")
+            except Exception:
+                s = ""
+            if s.startswith(("✅", "❌", "⛔", "🎞")):
+                continue
+
+            url = manager.url_by_item.get(iid) or tree.set(iid, "title")
+
+            item_out_dir = None
+            try:
+                op = getattr(manager, "out_path_by_item", {}).get(iid)
+                if op:
+                    item_out_dir = os.path.dirname(os.path.normpath(str(op)))
+            except Exception:
+                item_out_dir = None
+            try:
+                if (not item_out_dir) and getattr(manager, "out_dir_by_item", {}).get(iid):
+                    item_out_dir = str(getattr(manager, "out_dir_by_item", {}).get(iid))
+            except Exception:
+                pass
+            if not item_out_dir:
+                item_out_dir = out_dir
+
+            try:
+                manager.start_item(iid, url, item_out_dir)
+            except Exception:
+                pass
+
+        try:
+            _schedule_kino_queue_save()
+        except Exception:
+            pass
+
     def cancel_selected():
         sel = tree.selection()
         if not sel:
             return
-        for item in sel:
+        targets = []
+        try:
+            targets = sorted({ _top_item(i) for i in sel if i })
+        except Exception:
+            targets = list(sel)
+
+        for item in targets:
             try:
                 manager.cancel_item(item)
             except Exception:
@@ -3720,6 +5504,12 @@ def main():
             try:
                 if hasattr(manager, "url_by_item"):
                     manager.url_by_item.pop(item, None)
+                if hasattr(manager, "out_path_by_item"):
+                    manager.out_path_by_item.pop(item, None)
+                if hasattr(manager, "name_override_by_item"):
+                    manager.name_override_by_item.pop(item, None)
+                if hasattr(manager, "out_dir_by_item"):
+                    manager.out_dir_by_item.pop(item, None)
                 if hasattr(manager, "threads"):
                     manager.threads.pop(item, None)
             except Exception:
@@ -3736,9 +5526,143 @@ def main():
             _schedule_kino_queue_save()
         except Exception:
             pass
-                
+
+    def cancel_all():
+        items = list(tree.get_children())
+        if not items:
+            return
+        if not messagebox.askyesno("Подтверждение", "Отменить все загрузки в очереди?"):
+            return
+        for item in items:
+            try:
+                manager.cancel_item(item)
+            except Exception:
+                pass
+        try:
+            _schedule_kino_queue_save(0)
+        except Exception:
+            pass
+
+    def clear_all():
+        items = list(tree.get_children())
+        if not items:
+            return
+        if not messagebox.askyesno(
+            "Подтверждение",
+            "Убрать все из очереди?\nТекущие загрузки будут отменены.",
+        ):
+            return
+
+        for item in items:
+            try:
+                t = getattr(manager, "threads", {}).get(item)
+                is_alive = bool(t and t.is_alive())
+            except Exception:
+                is_alive = False
+
+            try:
+                manager.cancel_item(item)
+            except Exception:
+                pass
+
+            try:
+                if not is_alive and hasattr(manager, "cancel_events"):
+                    manager.cancel_events.pop(item, None)
+                if hasattr(manager, "url_by_item"):
+                    manager.url_by_item.pop(item, None)
+                if hasattr(manager, "out_path_by_item"):
+                    manager.out_path_by_item.pop(item, None)
+                if hasattr(manager, "name_override_by_item"):
+                    manager.name_override_by_item.pop(item, None)
+                if hasattr(manager, "out_dir_by_item"):
+                    manager.out_dir_by_item.pop(item, None)
+                if hasattr(manager, "threads"):
+                    manager.threads.pop(item, None)
+            except Exception:
+                pass
+
+            try:
+                tree.delete(item)
+            except Exception:
+                pass
+
+        try:
+            reindex_rows()
+        except Exception:
+            pass
+        try:
+            _schedule_kino_queue_save(0)
+        except Exception:
+            pass
+
+    def clear_done():
+        items = list(tree.get_children())
+        if not items:
+            return
+        done = []
+        for item in items:
+            try:
+                s = str(tree.set(item, "status") or "")
+            except Exception:
+                continue
+            if s.startswith("✅"):
+                done.append(item)
+        if not done:
+            return
+        if not messagebox.askyesno("Подтверждение", f"Убрать готовые из очереди? ({len(done)})"):
+            return
+
+        for item in done:
+            try:
+                if hasattr(manager, "cancel_events"):
+                    manager.cancel_events.pop(item, None)
+                if hasattr(manager, "url_by_item"):
+                    manager.url_by_item.pop(item, None)
+                if hasattr(manager, "out_path_by_item"):
+                    manager.out_path_by_item.pop(item, None)
+                if hasattr(manager, "name_override_by_item"):
+                    manager.name_override_by_item.pop(item, None)
+                if hasattr(manager, "out_dir_by_item"):
+                    manager.out_dir_by_item.pop(item, None)
+                if hasattr(manager, "threads"):
+                    manager.threads.pop(item, None)
+                if hasattr(manager, "final_status"):
+                    manager.final_status.pop(item, None)
+            except Exception:
+                pass
+            try:
+                tree.delete(item)
+            except Exception:
+                pass
+
+        try:
+            reindex_rows()
+        except Exception:
+            pass
+        try:
+            manager._update_counter_label()
+        except Exception:
+            pass
+        try:
+            _schedule_kino_queue_save(0)
+        except Exception:
+            pass
+
+    btn_cancel_all.config(command=cancel_all)
+    btn_clear_all.config(command=clear_all)
+    btn_clear_done.config(command=clear_done)
+    btn_pause.config(command=pause_selected)
+    btn_resume.config(command=resume_selected)
+    btn_resume_all.config(command=resume_all)
+    btn_convert.config(command=convert_selected)
+                  
     context_menu.add_command(label="Повторить / перезапустить загрузку",
                              command=retry_selected)
+    context_menu.add_command(label="🎞 Конвертировать (MUX без докачки)",
+                             command=convert_selected)
+    context_menu.add_separator()
+    context_menu.add_command(label="⏸ Пауза", command=pause_selected)
+    context_menu.add_command(label="▶ Возобновить", command=resume_selected)
     context_menu.add_command(label="Отменить и убрать из очереди",
                              command=cancel_selected)
     context_menu.add_command(
@@ -3750,7 +5674,7 @@ def main():
         item = tree.identify_row(event.y)
         if not item:
             return
-        tree.selection_set(item)
+        tree.selection_set(_top_item(item))
         # Раньше меню показывалось только при ошибке,
         # теперь — всегда, чтобы можно было перезапустить в любой момент.
         context_menu.tk_popup(event.x_root, event.y_root)
@@ -3762,6 +5686,7 @@ def main():
 
     scrollbar.config(command=tree.yview)
     tree.bind("<Button-3>", on_right_click)
+    tree.heading("#0", text="", anchor="center")
     tree.heading("#", text="№", anchor="center")
     tree.heading("title", text="Название / URL", anchor="w")
     tree.heading("status", text="Статус", anchor="center")
@@ -3770,6 +5695,7 @@ def main():
     except Exception:
         scale = 1.0
     scale = max(1.0, min(3.0, scale))
+    tree.column("#0", width=int(26 * scale), minwidth=int(18 * scale), anchor="center", stretch=False)
     tree.column("#", width=int(40 * scale), minwidth=int(30 * scale), anchor="center", stretch=False)
     tree.column("title", width=int(360 * scale), minwidth=int(200 * scale), anchor="w", stretch=True)
     tree.column("status", width=int(200 * scale), minwidth=int(140 * scale), anchor="center", stretch=False)
@@ -3777,6 +5703,21 @@ def main():
 
     style = ttk.Style()
     style_tree(style)
+
+    def _update_kino_queue_rowheight():
+        rowheight = max(22, int(26 * scale))
+        try:
+            style.configure("KinoQueue.Treeview", rowheight=rowheight)
+        except Exception:
+            pass
+
+    _update_kino_queue_rowheight()
+
+    try:
+        root._kino_queue_tree = tree
+        root._update_kino_queue_rowheight = _update_kino_queue_rowheight
+    except Exception:
+        pass
     
     # --- Кнопки управления очередью (скрываем, если флаг False) ---
     if SHOW_QUEUE_CONTROLS:
@@ -3856,6 +5797,37 @@ def main():
         history_cb=on_download_history_event,
     )
 
+    def _update_convert_button_state_once(*_):
+        try:
+            sel = tree.selection()
+            enabled = False
+            if sel:
+                iid = _top_item(sel[0])
+                try:
+                    s = str(tree.set(iid, "status") or "")
+                except Exception:
+                    s = ""
+                if s.startswith("🎞") or ("Ошибка MUX" in s) or s.startswith("❌ Ошибка MUX"):
+                    out_path = getattr(manager, "out_path_by_item", {}).get(iid)
+                    if out_path and os.path.isdir(out_path + ".parts"):
+                        enabled = True
+            btn_convert.config(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
+
+    def _poll_convert_button_state():
+        _update_convert_button_state_once()
+        try:
+            root.after(400, _poll_convert_button_state)
+        except Exception:
+            pass
+
+    try:
+        tree.bind("<<TreeviewSelect>>", _update_convert_button_state_once)
+    except Exception:
+        pass
+    _poll_convert_button_state()
+
     _queue_save_job = {"id": None}
 
     def _kqueue_snapshot() -> list[dict]:
@@ -3879,7 +5851,26 @@ def main():
                 pass
             q = manager.url_by_item.get(item) or title
             if q:
-                items.append({"q": str(q), "display": title, "status": status})
+                entry = {"q": str(q), "display": title, "status": status}
+                try:
+                    no = getattr(manager, "name_override_by_item", {}).get(item)
+                    if no:
+                        entry["name_override"] = str(no)
+                except Exception:
+                    pass
+                try:
+                    od = getattr(manager, "out_dir_by_item", {}).get(item)
+                    if od:
+                        entry["out_dir"] = str(od)
+                except Exception:
+                    pass
+                try:
+                    op = getattr(manager, "out_path_by_item", {}).get(item)
+                    if op:
+                        entry["out_path"] = str(op)
+                except Exception:
+                    pass
+                items.append(entry)
         # ограничим размер, чтобы settings.json не разрастался бесконечно
         try:
             if len(items) > 200:
@@ -3927,11 +5918,21 @@ def main():
             if not t:
                 return
 
-            if t.startswith(("✅", "❌", "⛔")):
+            # финальные + пауза сохраняем сразу
+            if t.startswith(("✅", "❌", "⛔", "🎞", "⏸")):
                 try:
                     root.after(0, lambda: _schedule_kino_queue_save(0))
                 except Exception:
                     pass
+                return
+
+            # прогресс/промежуточные статусы сохраняем реже, чтобы после краша/перезапуска
+            # не терялся последний % и этап.
+            try:
+                if "%" in t or t.startswith(("🔵", "🟣", "🔀", "⏳", "🧩", "🟡")):
+                    root.after(0, lambda: _schedule_kino_queue_save(800))
+            except Exception:
+                pass
 
         manager.set_status = _dm_set_status_persist
     except Exception:
@@ -3959,8 +5960,22 @@ def main():
             if "Ожидает входа" not in status and not status.startswith("⏸"):
                 continue
             q = manager.url_by_item.get(item) or tree.set(item, "title")
+            item_out_dir = None
             try:
-                manager.start_item(item, q, out_dir)
+                op = getattr(manager, "out_path_by_item", {}).get(item)
+                if op:
+                    item_out_dir = os.path.dirname(os.path.normpath(str(op)))
+            except Exception:
+                item_out_dir = None
+            try:
+                if (not item_out_dir) and getattr(manager, "out_dir_by_item", {}).get(item):
+                    item_out_dir = str(getattr(manager, "out_dir_by_item", {}).get(item))
+            except Exception:
+                pass
+            if not item_out_dir:
+                item_out_dir = out_dir
+            try:
+                manager.start_item(item, q, item_out_dir)
             except Exception:
                 pass
 
@@ -4363,7 +6378,7 @@ def main():
             logging.error("Ошибка при stop_all(): %s", e)
 
         try:
-            manager.shutdown(cancel_active=True, timeout=2.5)
+            manager.shutdown(cancel_active=True, pause_active=True, timeout=2.5)
         except Exception:
             pass
 
@@ -4421,6 +6436,13 @@ def main():
         except Exception:
             pass
 
+    # Позволяем внешним модулям (например, автообновлению) закрыть приложение
+    # «по-настоящему», минуя сворачивание в трей.
+    try:
+        root._force_exit_app = lambda: on_close(force_exit=True)
+    except Exception:
+        pass
+
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     def show_login_required():
@@ -4428,7 +6450,7 @@ def main():
         dlg = tk.Toplevel(root)
         dlg.title("Ошибка")
         try:
-            dlg.iconbitmap("icon.ico")
+            dlg.iconbitmap(get_app_icon())
         except Exception:
             pass
 
@@ -4680,6 +6702,10 @@ def main():
             r = (res or "").strip().lower()
             if r in ("success", "ok", "done", "готово"):
                 return "✅"
+            if r in ("prepared", "ready", "pending_mux", "ready_to_mux", "готово к конвертации"):
+                return "🎞"
+            if r in ("paused", "paused_error", "pause", "пауза", "прервано"):
+                return "⏸"
             if r in ("canceled", "cancelled", "отменено", "cancel"):
                 return "⛔"
             if r in ("error", "ошибка", "fail", "failed"):
@@ -5072,16 +7098,35 @@ def main():
     def login_to_kino():
         global kino_logged_in
         try:
-            kino_status.config(text="⏳ Инициализация входа.", fg=ACCENT_SECOND)
+            btn_kino.config(state="disabled")
+        except Exception:
+            pass
 
-            ok = real_login_to_kino(
-                lambda msg: kino_status.config(text=msg[-80:], fg=ACCENT_SECOND)
-            )
+        try:
+            kino_status.config(text="⏳ Инициализация входа.", fg=ACCENT_SECOND)
+        except Exception:
+            pass
+
+        def _task(busy: BusyOverlay) -> bool:
+            busy.set_message("⏳ Вход в Kino.pub…")
+
+            def _cb(msg: str):
+                msg = (msg or "")
+                short = msg[-80:]
+                busy.set_message(short or "⏳ Вход в Kino.pub…")
+                try:
+                    root.after(0, lambda: kino_status.config(text=short, fg=ACCENT_SECOND))
+                except Exception:
+                    pass
+
+            return bool(real_login_to_kino(_cb))
+
+        def _done(ok: bool, busy: BusyOverlay):
+            global kino_logged_in
+            global NOTIFICATIONS_ENABLED
 
             if ok:
                 kino_logged_in = True
-
-                global NOTIFICATIONS_ENABLED
                 NOTIFICATIONS_ENABLED = True
                 try:
                     notify_count_var.set(0)
@@ -5089,21 +7134,126 @@ def main():
                     pass
 
                 update_sidebar_status()
-                kino_status.config(text="✅ Вход успешно выполнен", fg=ACCENT_SECOND)
+                try:
+                    kino_status.config(text="✅ Вход успешно выполнен", fg=ACCENT_SECOND)
+                except Exception:
+                    pass
                 try:
                     _autostart_kino_queue_after_login()
+                except Exception:
+                    pass
+                # Прогреваем пул браузеров заранее: меньше задержка перед стартом первых загрузок.
+                try:
+                    pool.warm_up_async(kino_max_parallel)
                 except Exception:
                     pass
             else:
                 kino_logged_in = False
                 update_sidebar_status()
-                kino_status.config(text="❌ Не удалось войти", fg="red")
+                try:
+                    kino_status.config(text="❌ Не удалось войти", fg="red")
+                except Exception:
+                    pass
                 messagebox.showerror("Ошибка", "❌ Не удалось войти в Kino.pub")
 
-        except Exception as e:
+            try:
+                btn_kino.config(state="normal")
+            except Exception:
+                pass
+
+            busy.close()
+            if ok:
+                # Если логин шёл в браузере — возвращаем фокус на приложение
+                # и переключаемся на раздел Kino.pub, чтобы было сразу понятно, что вход завершён.
+                def _bring_to_front():
+                    try:
+                        show_screen(screens, "kino")
+                        set_nav_active(nav_items, "kino")
+                    except Exception:
+                        pass
+
+                    # Используем общую логику разворота (учитывает fullscreen/zoomed и tray).
+                    try:
+                        _show_from_tray()
+                    except Exception:
+                        try:
+                            root.deiconify()
+                        except Exception:
+                            pass
+                        try:
+                            root.state("zoomed" if START_MAXIMIZED else "normal")
+                        except Exception:
+                            pass
+                        try:
+                            root.lift()
+                            root.focus_force()
+                        except Exception:
+                            pass
+
+                    # Windows иногда игнорирует focus_force(), поэтому дублируем на уровне WinAPI.
+                    if os.name == "nt":
+                        try:
+                            import win32con
+                            import win32gui
+
+                            hwnd = int(root.winfo_id())
+                            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                            win32gui.SetWindowPos(
+                                hwnd,
+                                win32con.HWND_TOPMOST,
+                                0,
+                                0,
+                                0,
+                                0,
+                                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
+                            )
+                            win32gui.SetWindowPos(
+                                hwnd,
+                                win32con.HWND_NOTOPMOST,
+                                0,
+                                0,
+                                0,
+                                0,
+                                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
+                            )
+                            win32gui.SetForegroundWindow(hwnd)
+                        except Exception:
+                            pass
+
+                # Несколько попыток: после закрытия Chromium Windows не всегда отдаёт фокус сразу.
+                for delay in (0, 220, 900):
+                    try:
+                        root.after(delay, _bring_to_front)
+                    except Exception:
+                        pass
+                try:
+                    _bring_to_front()
+                except Exception:
+                    pass
+
+        def _err(e: Exception, _busy: BusyOverlay):
+            global kino_logged_in
             kino_logged_in = False
-            kino_status.config(text=f"Ошибка: {e}", fg="red")
+            update_sidebar_status()
+            try:
+                kino_status.config(text=f"Ошибка: {e}", fg="red")
+            except Exception:
+                pass
             messagebox.showerror("Ошибка", f"Ошибка при авторизации: {e}")
+            try:
+                btn_kino.config(state="normal")
+            except Exception:
+                pass
+
+        run_async(
+            root,
+            _task,
+            title="Kino.pub",
+            message="⏳ Вход в Kino.pub…",
+            modal=False,
+            on_done=_done,
+            on_error=_err,
+        )
 
 
 
@@ -5165,11 +7315,40 @@ def main():
 
                 # если не залогинены — ставим "паузу" для всего НЕ финального
                 if not kino_logged_in:
-                    if not status.startswith(("✅", "❌", "⛔")) and not status.startswith("⏸"):
+                    if not status.startswith(("✅", "❌", "⛔", "🎞")) and not status.startswith("⏸"):
                         status = "⏸ " + status
                 row_id = add_row(display, status=status)
                 try:
                     manager.url_by_item[row_id] = q
+                except Exception:
+                    pass
+                try:
+                    no = None
+                    if isinstance(entry, dict):
+                        no = entry.get("name_override") or entry.get("display_name_override")
+                    if no:
+                        if hasattr(manager, "name_override_by_item"):
+                            manager.name_override_by_item[row_id] = str(no)
+                except Exception:
+                    pass
+                try:
+                    op = None
+                    if isinstance(entry, dict):
+                        op = entry.get("out_path") or entry.get("out") or entry.get("file")
+                    if op:
+                        manager.out_path_by_item[row_id] = os.path.normpath(str(op))
+                except Exception:
+                    pass
+                try:
+                    od = None
+                    if isinstance(entry, dict):
+                        od = entry.get("out_dir") or entry.get("dir")
+                    if (not od) and isinstance(entry, dict):
+                        op2 = entry.get("out_path") or entry.get("out") or entry.get("file")
+                        if op2:
+                            od = os.path.dirname(os.path.normpath(str(op2)))
+                    if od and hasattr(manager, "out_dir_by_item"):
+                        manager.out_dir_by_item[row_id] = os.path.normpath(str(od))
                 except Exception:
                     pass
             except Exception:
@@ -5222,6 +7401,361 @@ def main():
         except Exception:
             pass
 
+    def _center_toplevel(win: tk.Toplevel, *, w: int = 620, h: int = 260):
+        try:
+            win.update_idletasks()
+        except Exception:
+            pass
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
+
+        try:
+            rw = int(root.winfo_width())
+            rh = int(root.winfo_height())
+            rx = int(root.winfo_rootx())
+            ry = int(root.winfo_rooty())
+        except Exception:
+            rw = rh = 0
+            rx = ry = 0
+
+        try:
+            sw = int(win.winfo_screenwidth())
+            sh = int(win.winfo_screenheight())
+        except Exception:
+            sw = sh = 0
+
+        if rw >= 240 and rh >= 240:
+            x = rx + (rw - w) // 2
+            y = ry + (rh - h) // 2
+        else:
+            x = (sw - w) // 2
+            y = (sh - h) // 2
+
+        try:
+            x = max(10, min(int(x), sw - w - 10))
+            y = max(10, min(int(y), sh - h - 10))
+        except Exception:
+            pass
+        try:
+            win.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
+        except Exception:
+            pass
+
+    def _ask_series_seasons(series_title: str, seasons_map: dict) -> list[int] | None:
+        seasons = sorted(int(x) for x in (seasons_map or {}).keys())
+        if not seasons:
+            return None
+
+        if len(seasons) == 1:
+            try:
+                total_eps = len(seasons_map.get(seasons[0]) or [])
+            except Exception:
+                total_eps = 0
+            if messagebox.askyesno(
+                "Скачать сериал",
+                f"Сериал: {series_title}\n"
+                f"Сезон: {seasons[0]}\n"
+                f"Эпизодов: {total_eps}\n\n"
+                "Добавить в очередь?",
+            ):
+                return seasons
+            return None
+
+        try:
+            from tkinter import ttk
+        except Exception:
+            ttk = None
+
+        res: dict = {"seasons": None}
+        win = tk.Toplevel(root)
+        win.title("Скачать сериал")
+        try:
+            win.iconbitmap(get_app_icon())
+        except Exception:
+            pass
+        win.configure(bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        win.resizable(False, False)
+        tk.Frame(win, bg=ACCENT, height=3).pack(fill="x", side="top")
+
+        body = tk.Frame(win, bg=BG_SURFACE)
+        body.pack(fill="both", expand=True, padx=16, pady=14)
+
+        tk.Label(
+            body,
+            text=f"📺 {series_title}",
+            bg=BG_SURFACE,
+            fg=ACCENT,
+            font=("Segoe UI Semibold", 14),
+            anchor="w",
+        ).pack(anchor="w")
+
+        info_lines = []
+        try:
+            for s_num in seasons:
+                cnt = len(seasons_map.get(s_num) or [])
+                info_lines.append(f"Сезон {s_num}: {cnt} эп.")
+        except Exception:
+            pass
+
+        tk.Label(
+            body,
+            text="\n".join(info_lines),
+            bg=BG_SURFACE,
+            fg=SUBTEXT,
+            font=("Segoe UI", 10),
+            justify="left",
+            anchor="w",
+        ).pack(anchor="w", pady=(4, 10))
+
+        mode = tk.StringVar(value="all")
+        season_var = tk.StringVar(value=str(seasons[0]))
+
+        rb_all = tk.Radiobutton(
+            body,
+            text=f"Скачать все сезоны ({len(seasons)})",
+            variable=mode,
+            value="all",
+            bg=BG_SURFACE,
+            fg=TEXT,
+            selectcolor=BG_CARD,
+            activebackground=BG_SURFACE,
+            activeforeground=TEXT,
+        )
+        rb_all.pack(anchor="w", pady=(2, 2))
+
+        row = tk.Frame(body, bg=BG_SURFACE)
+        row.pack(fill="x", pady=(2, 2))
+        rb_one = tk.Radiobutton(
+            row,
+            text="Скачать только сезон:",
+            variable=mode,
+            value="one",
+            bg=BG_SURFACE,
+            fg=TEXT,
+            selectcolor=BG_CARD,
+            activebackground=BG_SURFACE,
+            activeforeground=TEXT,
+        )
+        rb_one.pack(side="left")
+
+        if ttk:
+            cb = ttk.Combobox(row, values=[str(x) for x in seasons], textvariable=season_var, width=6, state="readonly")
+            cb.pack(side="left", padx=(8, 0))
+            try:
+                cb.bind("<<ComboboxSelected>>", lambda e: mode.set("one"))
+                cb.bind("<Button-1>", lambda e: mode.set("one"))
+            except Exception:
+                pass
+        else:
+            ent = tk.Entry(row, textvariable=season_var, width=6)
+            style_entry(ent)
+            ent.pack(side="left", padx=(8, 0))
+            try:
+                ent.bind("<FocusIn>", lambda e: mode.set("one"))
+                ent.bind("<Button-1>", lambda e: mode.set("one"))
+            except Exception:
+                pass
+
+        btns = tk.Frame(body, bg=BG_SURFACE)
+        btns.pack(fill="x", pady=(14, 0))
+
+        def _ok():
+            try:
+                if mode.get() == "all":
+                    res["seasons"] = seasons
+                else:
+                    res["seasons"] = [int(season_var.get())]
+            except Exception:
+                res["seasons"] = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def _cancel():
+            res["seasons"] = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        btn_ok = tk.Button(btns, text="Добавить в очередь", command=_ok)
+        style_secondary(btn_ok)
+        btn_ok.pack(side="right")
+
+        btn_cancel = tk.Button(btns, text="Отмена", command=_cancel)
+        style_secondary(btn_cancel)
+        btn_cancel.pack(side="right", padx=(0, 8))
+
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        _center_toplevel(win, w=640, h=300)
+        try:
+            win.transient(root)
+            win.grab_set()
+            win.lift()
+            win.attributes("-topmost", True)
+            win.after(200, lambda: win.attributes("-topmost", False))
+        except Exception:
+            pass
+
+        try:
+            win.wait_window()
+        except Exception:
+            pass
+        return res.get("seasons")
+
+    def start_kino_series_download():
+        global kino_logged_in
+        if not kino_logged_in:
+            show_login_required()
+            return
+
+        series_url = kino_input.get().strip()
+        if not series_url:
+            messagebox.showerror("Ошибка", "Вставьте ссылку на сериал.")
+            return
+        if not series_url.startswith("http"):
+            messagebox.showerror("Ошибка", "Для «Скачать сериал» нужна ссылка (URL), а не текстовый запрос.")
+            return
+
+        out_dir = _get_out_dir()
+        if not out_dir:
+            return
+
+        def _task(busy):
+            from kino_pub_downloader import parse_series_episodes
+
+            drv = get_search_driver()
+
+            def _st(m: str):
+                try:
+                    busy.set_message(str(m))
+                except Exception:
+                    pass
+
+            _st("⏳ Анализ сериала…")
+            data = parse_series_episodes(series_url, driver=drv, status_cb=_st)
+            return data
+
+        def _done(data, busy):
+            try:
+                busy.close()
+            except Exception:
+                pass
+
+            try:
+                title = str((data or {}).get("title") or "").strip()
+            except Exception:
+                title = ""
+            seasons_map = (data or {}).get("seasons") if isinstance(data, dict) else None
+            if not title or not isinstance(seasons_map, dict) or not seasons_map:
+                messagebox.showerror("Сериал", "Не удалось разобрать сезоны/эпизоды по ссылке.")
+                return
+
+            chosen = _ask_series_seasons(title, seasons_map)
+            if not chosen:
+                return
+
+            # собираем список эпизодов
+            series_root = os.path.join(out_dir, title)
+            try:
+                os.makedirs(series_root, exist_ok=True)
+            except Exception:
+                series_root = out_dir
+
+            to_add: list[tuple[str, str, str]] = []
+            seen_urls: set[str] = set()
+            seen_titles: set[str] = set()
+            for iid in tree.get_children():
+                try:
+                    u = manager.url_by_item.get(iid)
+                    if u:
+                        seen_urls.add(str(u))
+                except Exception:
+                    pass
+                try:
+                    t0 = str(tree.set(iid, "title") or "").strip()
+                    if t0:
+                        seen_titles.add(t0)
+                except Exception:
+                    pass
+
+            for s_num in chosen:
+                season_dir = os.path.join(series_root, f"Season {int(s_num)}")
+                try:
+                    os.makedirs(season_dir, exist_ok=True)
+                except Exception:
+                    season_dir = series_root
+
+                eps = seasons_map.get(int(s_num)) or []
+                for e in eps:
+                    try:
+                        ep = int((e or {}).get("episode") or 0)
+                    except Exception:
+                        ep = 0
+                    try:
+                        url = str((e or {}).get("url") or "").strip()
+                    except Exception:
+                        url = ""
+                    if not url or ep <= 0:
+                        continue
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    display = f"{title} S{int(s_num):02d}E{int(ep):02d}"
+                    if display in seen_titles:
+                        continue
+                    seen_titles.add(display)
+                    to_add.append((display, url, season_dir))
+
+            if not to_add:
+                messagebox.showinfo("Сериал", "Все серии уже в очереди (или не удалось найти ссылки эпизодов).")
+                return
+
+            # добавляем в очередь и запускаем
+            for display, url, item_out_dir in to_add:
+                item_id = add_row(display, status="🟡 Подготовка...")
+                try:
+                    manager.start_item(item_id, url, item_out_dir, name_override=display)
+                except Exception:
+                    try:
+                        manager.url_by_item[item_id] = url
+                    except Exception:
+                        pass
+            try:
+                _schedule_kino_queue_save()
+            except Exception:
+                pass
+
+            try:
+                kino_input.delete(0, "end")
+            except Exception:
+                pass
+
+            try:
+                messagebox.showinfo("Сериал", f"Добавлено в очередь: {len(to_add)}")
+            except Exception:
+                pass
+
+        def _err(e, busy):
+            try:
+                busy.close()
+            except Exception:
+                pass
+            messagebox.showerror("Сериал", str(e))
+
+        run_async(
+            root,
+            _task,
+            title="Kino.pub",
+            message="⏳ Анализ сериала…",
+            modal=False,
+            on_done=_done,
+            on_error=_err,
+        )
+
     def on_kino_input_click(event):
         if not kino_logged_in:
             show_login_required()
@@ -5236,7 +7770,7 @@ def main():
     def stop_queue():
         manager.stop_all()
     def remove_selected():
-        pass
+        cancel_selected()
     if SHOW_QUEUE_CONTROLS:
         btn_import.config(command=import_list)
         btn_delete.config(command=remove_selected)
@@ -5245,6 +7779,7 @@ def main():
 
     
     btn_download.config(command=start_kino_download)
+    btn_download_series.config(command=start_kino_series_download)
 
         # ========== Экран поиска Kino.pub (kino_search) ==========
     from tkinter import ttk  # на всякий случай, если выше не импортнулся
@@ -5344,7 +7879,7 @@ def main():
     
 
     # Enter в этом поле запускает поиск
-    search_entry.bind("<Return>", lambda e: search_one_title())
+    search_entry.bind("<Return>", lambda e: (search_one_title() or "break"))
 
     btn_search_one = tk.Button(one_row, text="Искать")
     style_secondary(btn_search_one)
@@ -5703,7 +8238,10 @@ def main():
 
         try:
             WebDriverWait(drv, 10).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
+                lambda d: (
+                    d.find_elements(By.CSS_SELECTOR, "div.item-title a[href*='/item/']")
+                    or d.find_elements(By.CSS_SELECTOR, "div#items div.item-info")
+                )
             )
         except Exception:
             logging.warning("Страница новинок долго не загружается для страницы %s", page)
@@ -5773,6 +8311,26 @@ def main():
                     year = m.group(0)
                     break
 
+            # Новый layout иногда не кладёт год в item-author — вытаскиваем из общего текста карточки.
+            if not year:
+                try:
+                    cand = ""
+                    a_year = card.select_one("a.text-success[href*='years='], a[href*='years=']")
+                    if a_year is not None:
+                        cand = (a_year.get_text(" ", strip=True) or "") + " " + (a_year.get("href") or "")
+
+                    if not cand:
+                        cand = card.get_text(" ", strip=True) or ""
+
+                    if not cand:
+                        cand = str(card)
+
+                    m = re.search(r"\b(19|20)\d{2}\b", cand)
+                    if m:
+                        year = m.group(0)
+                except Exception:
+                    pass
+
             base_title_ru = re.sub(r"\s*\(\d{4}\)\s*", "", text_ru).strip()
             display_title = f"{base_title_ru} ({year})" if year else base_title_ru
 
@@ -5804,62 +8362,38 @@ def main():
             tree_search.delete(item)
         search_meta.clear()
 
-        # ищем реальные карточки на сайте
-        results = kino_search_real(title, max_results=50)
+        try:
+            btn_search_one.config(state="disabled")
+            search_entry.config(state="disabled")
+        except Exception:
+            pass
+        try:
+            btn_search_list.config(state="disabled")
+            btn_search_txt.config(state="disabled")
+        except Exception:
+            pass
 
-        if not results:
-            messagebox.showinfo("Поиск", f"По запросу '{raw}' ничего не найдено.")
-            return
+        def _task(busy: BusyOverlay):
+            busy.set_message(f"⏳ Поиск: {title}")
+            return kino_search_real(title, max_results=50)
 
-        for display_title, url, base_title, y, eng_title in results:
-            # В таблице можно показывать "Рус / Англ", чтобы было понятно, что это за релиз
-            shown_title = display_title
-            if eng_title:
-                shown_title = f"{display_title} / {eng_title}"
+        def _done(results, busy: BusyOverlay):
+            try:
+                btn_search_one.config(state="normal")
+                search_entry.config(state="normal")
+            except Exception:
+                pass
+            try:
+                btn_search_list.config(state="normal")
+                btn_search_txt.config(state="normal")
+            except Exception:
+                pass
 
-            item_id = tree_search.insert(
-                "",
-                "end",
-                values=("☐", raw, shown_title, y or "", url),
-            )
-            search_meta[item_id] = {
-                "query": raw,
-                "title": base_title,
-                "year":  y,
-                "url":   url,
-                "eng_title": eng_title,
-            }
-
-    def search_by_list():
-        raw_lines = list_text.get("1.0", "end").splitlines()
-
-        # очищаем старые результаты
-        for item in tree_search.get_children():
-            tree_search.delete(item)
-        search_meta.clear()
-        checked_items.clear()
-
-        anything = False
-
-        for line in raw_lines:
-            original = line.strip()
-            if not original:
-                continue
-
-            # отбрасываем "(год)" из строки
-            title, _ = split_title_year(original)
-            if not title:
-                continue
-
-            # ТЕПЕРЬ: для списка берём НЕ один, а несколько вариантов
-            # можно оставить 50 как в одиночном поиске,
-            # либо поставить 20, если боишься огромных списков
-            results = kino_search_real(title, max_results=50)
             if not results:
-                logging.info("Список: для '%s' ничего не найдено", line)
-                continue
+                messagebox.showinfo("Поиск", f"По запросу '{raw}' ничего не найдено.")
+                busy.close()
+                return
 
-            # добавляем ВСЕ найденные варианты в таблицу
             for display_title, url, base_title, y, eng_title in results:
                 shown_title = display_title
                 if eng_title:
@@ -5868,23 +8402,160 @@ def main():
                 item_id = tree_search.insert(
                     "",
                     "end",
-                    values=("☐", original, shown_title, y or "", url),
+                    values=("☐", raw, shown_title, y or "", url),
                 )
                 search_meta[item_id] = {
-                    "query": original,    # что было в списке
-                    "title": base_title,  # базовый рус. тайтл
+                    "query": raw,
+                    "title": base_title,
                     "year":  y,
                     "url":   url,
                     "eng_title": eng_title,
                 }
 
-                anything = True
+            busy.close()
 
-        if not anything:
-            messagebox.showinfo(
-                "Поиск",
-                "Список пустой или по нему ничего не найдено."
-            )
+        def _err(e: Exception, _busy: BusyOverlay):
+            try:
+                btn_search_one.config(state="normal")
+                search_entry.config(state="normal")
+            except Exception:
+                pass
+            try:
+                btn_search_list.config(state="normal")
+                btn_search_txt.config(state="normal")
+            except Exception:
+                pass
+            messagebox.showerror("Ошибка", f"Ошибка поиска:\n{e}")
+
+        run_async(
+            root,
+            _task,
+            title="Поиск Kino.pub",
+            message="⏳ Поиск на Kino.pub…",
+            modal=False,
+            on_done=_done,
+            on_error=_err,
+        )
+
+    def search_by_list():
+        global kino_logged_in
+        if not kino_logged_in:
+            show_login_required()
+            return
+
+        raw_lines = list_text.get("1.0", "end").splitlines()
+
+        # очищаем старые результаты
+        for item in tree_search.get_children():
+            tree_search.delete(item)
+        search_meta.clear()
+        checked_items.clear()
+
+        try:
+            btn_search_one.config(state="disabled")
+            search_entry.config(state="disabled")
+        except Exception:
+            pass
+        try:
+            btn_search_list.config(state="disabled")
+            btn_search_txt.config(state="disabled")
+        except Exception:
+            pass
+
+        def _task(busy: BusyOverlay):
+            rows = []
+            lines = [ln.strip() for ln in raw_lines if ln.strip()]
+            total = max(1, len(lines))
+
+            for i, original in enumerate(lines, start=1):
+                title, _ = split_title_year(original)
+                if not title:
+                    continue
+
+                busy.set_message(f"⏳ Список: {i}/{total}: {title}")
+
+                results = kino_search_real(title, max_results=50)
+                if not results:
+                    logging.info("Список: для '%s' ничего не найдено", original)
+                    continue
+
+                for display_title, url, base_title, y, eng_title in results:
+                    rows.append((original, display_title, url, base_title, y, eng_title))
+
+            return rows
+
+        def _done(rows, busy: BusyOverlay):
+            try:
+                btn_search_one.config(state="normal")
+                search_entry.config(state="normal")
+            except Exception:
+                pass
+            try:
+                btn_search_list.config(state="normal")
+                btn_search_txt.config(state="normal")
+            except Exception:
+                pass
+
+            if not rows:
+                messagebox.showinfo("Поиск", "Список пустой или по нему ничего не найдено.")
+                busy.close()
+                return
+
+            chunk = 80
+            total = len(rows)
+
+            def _insert(i=0):
+                end = min(total, i + chunk)
+                busy.set_message(f"⏳ Добавляю в таблицу: {end}/{total}")
+
+                for original, display_title, url, base_title, y, eng_title in rows[i:end]:
+                    shown_title = display_title
+                    if eng_title:
+                        shown_title = f"{display_title} / {eng_title}"
+
+                    item_id = tree_search.insert(
+                        "",
+                        "end",
+                        values=("☐", original, shown_title, y or "", url),
+                    )
+                    search_meta[item_id] = {
+                        "query": original,
+                        "title": base_title,
+                        "year":  y,
+                        "url":   url,
+                        "eng_title": eng_title,
+                    }
+
+                if end < total:
+                    root.after(0, lambda: _insert(end))
+                    return
+
+                busy.close()
+
+            _insert(0)
+
+        def _err(e: Exception, _busy: BusyOverlay):
+            try:
+                btn_search_one.config(state="normal")
+                search_entry.config(state="normal")
+            except Exception:
+                pass
+            try:
+                btn_search_list.config(state="normal")
+                btn_search_txt.config(state="normal")
+            except Exception:
+                pass
+            messagebox.showerror("Ошибка", f"Ошибка поиска по списку:\n{e}")
+
+        run_async(
+            root,
+            _task,
+            title="Поиск по списку",
+            message="⏳ Поиск по списку…",
+            modal=False,
+            on_done=_done,
+            on_error=_err,
+        )
 
 
 
@@ -5913,16 +8584,16 @@ def main():
     btn_search_list.config(command=search_by_list)
     btn_search_txt.config(command=search_from_txt)
 
-    def ask_news_range(parent) -> tuple[int | None, int | None]:
+    def ask_news_range(parent) -> tuple[int | None, int | None, bool]:
         """
         Красивый диалог 'Новинки Kino.pub': 
         'Начать с страницы __  по страницу __'.
-        Возвращает (start_page, end_page) или (None, None), если Cancel.
+        Возвращает (start_page, end_page, resolve_years) или (None, None, ...), если Cancel.
         """
         dlg = tk.Toplevel(parent)
         dlg.title("Новинки Kino.pub")
         try:
-            dlg.iconbitmap("icon.ico")
+            dlg.iconbitmap(get_app_icon())
         except Exception:
             pass
 
@@ -5939,7 +8610,7 @@ def main():
         except Exception:
             scale = 1.0
         scale = max(1.0, min(3.0, scale))
-        w, h = int(520 * scale), int(260 * scale)
+        w, h = int(520 * scale), int(300 * scale)
         sw = int(parent.winfo_screenwidth())
         sh = int(parent.winfo_screenheight())
         w = min(w, max(420, sw - 80))
@@ -5948,7 +8619,7 @@ def main():
         y = (sh - h) // 2
         dlg.geometry(f"{w}x{h}+{x}+{y}")
         try:
-            dlg.minsize(420, 220)
+            dlg.minsize(420, 240)
         except Exception:
             pass
 
@@ -6048,7 +8719,30 @@ def main():
         )
         error_lbl.pack(pady=(2, 0))
 
-        res = {"start": None, "end": None}
+        try:
+            s0 = load_settings()
+            default_resolve_years = bool(s0.get("kino_news_resolve_years", False))
+        except Exception:
+            default_resolve_years = False
+        resolve_var = tk.BooleanVar(value=default_resolve_years)
+
+        chk_years = tk.Checkbutton(
+            dlg,
+            text="Подтягивать год для каждой карточки (медленно)",
+            variable=resolve_var,
+            onvalue=True,
+            offvalue=False,
+            bg=BG_SURFACE,
+            fg=TEXT,
+            activebackground=BG_SURFACE,
+            activeforeground=TEXT,
+            selectcolor=BG_SURFACE,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        chk_years.pack(anchor="w", padx=18, pady=(6, 0))
+
+        res = {"start": None, "end": None, "resolve_years": bool(resolve_var.get())}
 
         def on_ok():
             try:
@@ -6070,6 +8764,13 @@ def main():
 
             res["start"] = s
             res["end"] = e
+            res["resolve_years"] = bool(resolve_var.get())
+            try:
+                sset = load_settings()
+                sset["kino_news_resolve_years"] = bool(resolve_var.get())
+                save_settings(sset)
+            except Exception:
+                pass
             dlg.destroy()
 
         def on_cancel():
@@ -6095,12 +8796,12 @@ def main():
         dlg.bind("<Escape>", lambda e: on_cancel())
 
         parent.wait_window(dlg)
-        return res["start"], res["end"]
+        return res["start"], res["end"], bool(res.get("resolve_years", False))
 
     # новинки пока оставим заглушкой
     def load_news():
         # красивый диалог "с / по"
-        start_page, end_page = ask_news_range(root)
+        start_page, end_page, resolve_years = ask_news_range(root)
         if start_page is None or end_page is None:
             return
 
@@ -6108,37 +8809,91 @@ def main():
         for item in tree_search.get_children():
             tree_search.delete(item)
         search_meta.clear()
+        checked_items.clear()
 
-        # тянем каждую страницу /new?page=N
-        for page in range(start_page, end_page + 1):
+        try:
+            btn_news.config(state="disabled")
+        except Exception:
+            pass
+
+        def _task(busy: BusyOverlay):
+            rows = []
+            total = max(1, (end_page - start_page + 1))
+            for i, page in enumerate(range(start_page, end_page + 1), start=1):
+                busy.set_message(f"⏳ Новинки: страница {page} ({i}/{total})")
+                try:
+                    page_results = kino_fetch_news_page(page, max_results=None)
+                except Exception as e:
+                    logging.error("Ошибка при загрузке новинок страницы %s: %s", page, e)
+                    continue
+
+                for _display_title, url, base_title, year, eng_title in page_results:
+                    if resolve_years and (not year):
+                        try:
+                            year = fetch_year_from_card(url)
+                        except Exception:
+                            year = None
+
+                    rows.append((page, url, base_title, year, eng_title))
+            return rows
+
+        def _done(rows, busy: BusyOverlay):
+            chunk = 60
+            total = len(rows)
+
+            def _insert(i=0):
+                end = min(total, i + chunk)
+                if total:
+                    busy.set_message(f"⏳ Добавляю в таблицу: {end}/{total}")
+
+                for page, url, base_title, year, eng_title in rows[i:end]:
+                    query_label = f"стр {page}"
+                    title_for_grid = base_title
+
+                    item_id = tree_search.insert(
+                        "",
+                        "end",
+                        values=("☐", query_label, title_for_grid, year or "", url),
+                    )
+                    search_meta[item_id] = {
+                        "query": query_label,
+                        "title": base_title,
+                        "year":  year,
+                        "url":   url,
+                        "eng_title": eng_title,
+                    }
+
+                if end < total:
+                    root.after(0, lambda: _insert(end))
+                    return
+
+                try:
+                    btn_news.config(state="normal")
+                except Exception:
+                    pass
+                busy.close()
+
+            _insert(0)
+
+        def _err(e: Exception, _busy: BusyOverlay):
             try:
-                page_results = kino_fetch_news_page(page, max_results=None)
-            except Exception as e:
-                logging.error("Ошибка при загрузке новинок страницы %s: %s", page, e)
-                continue
+                btn_news.config(state="normal")
+            except Exception:
+                pass
+            messagebox.showerror("Ошибка", f"Не удалось загрузить новинки:\n{e}")
 
-            for display_title, url, base_title, year, eng_title in page_results:
-                if not year:
-                    year = fetch_year_from_card(url)
-
-                query_label = f"стр {page}"
-                title_for_grid = base_title
-
-                item_id = tree_search.insert(
-                    "",
-                    "end",
-                    values=("☐", query_label, title_for_grid, year or "", url),
-                )
-                search_meta[item_id] = {
-                    "query": query_label,
-                    "title": base_title,
-                    "year":  year,
-                    "url":   url,
-                    "eng_title": eng_title,
-                }
+        run_async(
+            root,
+            _task,
+            title="Новинки Kino.pub",
+            message="⏳ Загружаю новинки…",
+            modal=False,
+            on_done=_done,
+            on_error=_err,
+        )
 
 
-        # привязываем кнопку
+    # привязываем кнопку
     btn_news.config(command=load_news)
 
     # --- Кнопка: отправить выбранные в очередь скачивания ---
@@ -6261,6 +9016,12 @@ def main():
             req_text.insert("1.0", "\n".join(lines))
 
             # 3) переключаем экран
+            try:
+                _active[0] = "requests"
+                set_nav_active(nav_items, "requests")
+                animate_nav_indicator(nav_items["requests"])
+            except Exception:
+                pass
             slide_switch(kino_search, requests, root, "right")   
 
     btn_add_to_queue.config(command=add_selected_from_search)

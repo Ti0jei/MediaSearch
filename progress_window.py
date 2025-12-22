@@ -1,36 +1,65 @@
 import time
 import os
+import sys
 import tkinter as tk
 from tkinter import ttk
 import itertools
 
 APP_VERSION = "1.1"
 
-# --- Палитра как в основном приложении ---
-BRAND_SKY     = "#8AADD3"   # светло-голубой
-BRAND_MAGENTA = "#A24BA1"   # маджента
-BRAND_NAVY    = "#1C226B"   # глубокий синий
+_FALLBACK_THEME = {
+    # соответствует тёмной теме из основного приложения
+    "BG_WINDOW":  "#0f1720",
+    "BG_SURFACE": "#131f2b",
+    "BG_CARD":    "#172637",
+    "BORDER":     "#26384b",
+    "TEXT":       "#f3f7ff",
+    "SUBTEXT":    "#a6b2c5",
+    "TEXT_ON_ACCENT": "#0b1220",
+    "HOVER_BG":   "#1b2b3a",
+    "ACCENT":        "#bb86fc",
+    "ACCENT_SECOND": "#bb86fc",
+}
 
-BG_WINDOW  = "#0B0F2A"      # общий фон
-BG_SURFACE = "#13183A"      # панели/карточки
-BORDER     = "#222A5A"      # границы
-TEXT       = "#E9ECF7"
-SUBTEXT    = "#A8B2D9"
 
-ACCENT        = BRAND_MAGENTA
-ACCENT_HOVER  = "#B866B7"
-ACCENT_SECOND = BRAND_SKY
+def _get_theme(root) -> dict:
+    """
+    Берём палитру прямо из приложения (root._theme_palette),
+    чтобы окно копирования выглядело 1-в-1 как текущая тема.
+    """
+    try:
+        pal = getattr(root, "_theme_palette", None)
+        if isinstance(pal, dict) and pal.get("BG_SURFACE") and pal.get("TEXT"):
+            return pal
+    except Exception:
+        pass
+    return _FALLBACK_THEME.copy()
 
 
-def style_secondary(btn: tk.Button):
+def _style_secondary(btn: tk.Button, *, theme: dict):
+    bg = theme.get("BG_CARD") or _FALLBACK_THEME["BG_CARD"]
+    fg = theme.get("TEXT") or _FALLBACK_THEME["TEXT"]
+    hover_bg = theme.get("HOVER_BG") or bg
+    border = theme.get("BORDER") or _FALLBACK_THEME["BORDER"]
+    accent = theme.get("ACCENT_SECOND") or theme.get("ACCENT") or _FALLBACK_THEME["ACCENT"]
+
     btn.config(
-        bg="#18204C", fg=ACCENT_SECOND,
-        activebackground="#1E275A", activeforeground=ACCENT_SECOND,
-        relief="flat", borderwidth=0, cursor="hand2",
-        font=("Segoe UI", 10, "bold"),
-        padx=14, pady=6,
-        highlightbackground=ACCENT_SECOND, highlightthickness=1,
+        bg=bg,
+        fg=fg,
+        activebackground=hover_bg,
+        activeforeground=fg,
+        relief="flat",
+        borderwidth=0,
+        cursor="hand2",
+        font=("Segoe UI", 10),
+        padx=14,
+        pady=8,
+        highlightthickness=1,
+        highlightbackground=border,
     )
+
+    btn.bind("<Enter>", lambda e: btn.config(bg=hover_bg, highlightbackground=accent))
+    btn.bind("<Leave>", lambda e: btn.config(bg=bg, highlightbackground=border))
 
 
 class ProgressWindow:
@@ -41,6 +70,18 @@ class ProgressWindow:
         self.start_time = time.time()
         self.cancelled = False
 
+        theme = _get_theme(root)
+        self._theme = theme
+
+        BG_WINDOW = theme.get("BG_WINDOW") or _FALLBACK_THEME["BG_WINDOW"]
+        BG_SURFACE = theme.get("BG_SURFACE") or _FALLBACK_THEME["BG_SURFACE"]
+        BG_CARD = theme.get("BG_CARD") or _FALLBACK_THEME["BG_CARD"]
+        BORDER = theme.get("BORDER") or _FALLBACK_THEME["BORDER"]
+        TEXT = theme.get("TEXT") or _FALLBACK_THEME["TEXT"]
+        SUBTEXT = theme.get("SUBTEXT") or _FALLBACK_THEME["SUBTEXT"]
+        ACCENT = theme.get("ACCENT") or _FALLBACK_THEME["ACCENT"]
+        ACCENT_SECOND = theme.get("ACCENT_SECOND") or ACCENT
+
         # --- окно ---
         self.win = tk.Toplevel(root)
         self.alive = True                               # ← окно «живое»
@@ -48,33 +89,35 @@ class ProgressWindow:
         self.win.title(title)
         self.win.geometry("520x200")
         self.win.resizable(False, False)
-        self.win.configure(bg=BG_WINDOW)
+        self.win.configure(bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
 
         try:
-            self.win.iconbitmap("icon.ico")
+            if getattr(sys, "frozen", False):
+                base_dir = os.path.dirname(sys.executable)
+            else:
+                base_dir = os.path.dirname(__file__)
+            icon_path = os.path.join(base_dir, "icon.ico")
+            if os.path.exists(icon_path):
+                self.win.iconbitmap(icon_path)
         except Exception:
             pass
+
+        tk.Frame(self.win, bg=ACCENT, height=3).pack(fill="x", side="top")
 
         # --- стиль прогрессбара под тёмную тему ---
         style = ttk.Style(self.win)
         style.theme_use("clam")
         style.configure(
             "Movie.Horizontal.TProgressbar",
-            troughcolor=BG_WINDOW,
+            troughcolor=BG_CARD,
             background=ACCENT,
             bordercolor=BG_SURFACE,
             lightcolor=ACCENT,
             darkcolor=ACCENT,
         )
 
-        # --- карточка внутри окна ---
-        frame = tk.Frame(
-            self.win,
-            bg=BG_SURFACE,
-            highlightbackground=BORDER,
-            highlightthickness=1,
-        )
-        frame.pack(fill="both", expand=True, padx=14, pady=12)
+        frame = tk.Frame(self.win, bg=BG_SURFACE)
+        frame.pack(fill="both", expand=True, padx=16, pady=14)
 
         # заголовок
         tk.Label(
@@ -146,7 +189,7 @@ class ProgressWindow:
             text="Отмена",
             command=self._cancel,
         )
-        style_secondary(self.cancel_btn)
+        _style_secondary(self.cancel_btn, theme=theme)
         self.cancel_btn.pack(side="right")
 
         # базовые настройки окна — можно сворачивать и работать с другими окнами

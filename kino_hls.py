@@ -16,6 +16,11 @@ else:
     CREATE_NO_WINDOW = 0  # на *nix просто игнорируется
 
 _FFMPEG_LOCK = threading.Lock()  # пока про запас, если захочешь синхронизировать только лог-файлы
+MUX_MAX_PARALLEL = 4  # максимум одновременных MUX (ffmpeg)
+_MUX_SEMA = threading.Semaphore(MUX_MAX_PARALLEL)
+HLS_SEGMENT_MAX_PARALLEL = 16  # общий лимит одновременных запросов сегментов (стабильность)
+_HLS_SEGMENT_SEMA = threading.Semaphore(HLS_SEGMENT_MAX_PARALLEL)
+_CF_SOLVE_LOCK = threading.Lock()  # показываем окно CF только одно за раз
 
 
 class DownloadCancelled(Exception):
@@ -74,7 +79,7 @@ def _running_inside_vscode() -> bool:
         or os.environ.get("TERM_PROGRAM") == "vscode"
     )
 
-def _run_ffmpeg(cmd, cancel_event=None) -> int:
+def _run_ffmpeg(cmd, cancel_event=None, status_cb=None) -> int:
     """Безопасный запуск ffmpeg — без окна, лог в уникальный файл, stdin отключён."""
     ffmpeg_bin = cmd[0]
     if not os.path.isfile(ffmpeg_bin):
@@ -88,24 +93,219 @@ def _run_ffmpeg(cmd, cancel_event=None) -> int:
             else:
                 raise FileNotFoundError(f"⚠️ ffmpeg не найден: {ffmpeg_bin}")
 
+    def _fmt_hms(seconds: float) -> str:
+        try:
+            s = max(0, int(seconds))
+        except Exception:
+            s = 0
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return f"{h:02d}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
+
+    def _parse_hhmmss_us(value: str) -> int | None:
+        try:
+            t = (value or "").strip()
+            if not t or t == "N/A":
+                return None
+            hh, mm, rest = t.split(":", 2)
+            if "." in rest:
+                ss, frac = rest.split(".", 1)
+                frac = re.sub(r"\D", "", frac)[:6]
+                frac = (frac + "000000")[:6]
+            else:
+                ss, frac = rest, "000000"
+            total = (int(hh) * 3600 + int(mm) * 60 + int(ss)) * 1_000_000 + int(frac)
+            return max(0, int(total))
+        except Exception:
+            return None
+
+    def _probe_duration_us(media_path: str | None) -> int | None:
+        try:
+            if not media_path or not os.path.isfile(media_path):
+                return None
+        except Exception:
+            return None
+
+        ffprobe = None
+        try:
+            fb = str(cmd[0] or "")
+            if fb.lower().endswith("ffmpeg.exe"):
+                cand = os.path.join(os.path.dirname(fb), "ffprobe.exe")
+                if os.path.isfile(cand):
+                    ffprobe = cand
+        except Exception:
+            ffprobe = None
+        if not ffprobe:
+            ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+
+        try:
+            res = sp.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    media_path,
+                ],
+                stdout=sp.PIPE,
+                stderr=sp.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if res.returncode != 0:
+                return None
+            s = (res.stdout or "").strip().splitlines()[0].strip()
+            sec = float(s)
+            if sec <= 0:
+                return None
+            return int(sec * 1_000_000)
+        except Exception:
+            return None
+
+    mux_acquired = False
     try:
+        # ограничиваем количество одновременно запущенных ffmpeg (MUX)
+        while True:
+            if _is_cancelled(cancel_event):
+                return -2
+            if _MUX_SEMA.acquire(timeout=0.2):
+                mux_acquired = True
+                break
+
         import uuid
+
         log_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"ffmpeg_log_{uuid.uuid4().hex}.txt")
 
-        # БОЛЬШЕ НИКАКИХ ГЛОБАЛЬНЫХ СЕМАФОРОВ:
-        with open(log_path, "w", encoding="utf-8") as log:
-            proc = sp.Popen(
-                cmd,
-                stdout=log,
-                stderr=sp.STDOUT,
-                stdin=sp.DEVNULL,
-                creationflags=CREATE_NO_WINDOW,
-            )
+        total_us: int | None = None
+        out_us: int | None = None
+        start_ts = time.time()
+        last_emit_pct = -1
+        last_emit_at = 0.0
+
+        if status_cb and "-progress" not in cmd:
+            # Прогресс пишем в stdout (pipe:1), чтобы показать %/ETA.
+            # Вставляем после -loglevel <lvl>, если он есть.
+            insert_at = 1
+            try:
+                for i in range(len(cmd) - 1):
+                    if cmd[i] == "-loglevel":
+                        insert_at = i + 2
+                        break
+            except Exception:
+                insert_at = 1
+
+            cmd = list(cmd)
+            cmd[insert_at:insert_at] = ["-nostats", "-progress", "pipe:1"]
+
+            try:
+                in_path = None
+                if "-i" in cmd:
+                    in_idx = cmd.index("-i")
+                    if in_idx + 1 < len(cmd):
+                        in_path = cmd[in_idx + 1]
+                total_us = _probe_duration_us(in_path)
+            except Exception:
+                total_us = None
+
+        def _emit_mux_progress(force: bool = False) -> None:
+            nonlocal last_emit_pct, last_emit_at
+            if not status_cb or not total_us or not out_us:
+                return
+            try:
+                now = time.time()
+                p = max(0.0, min(1.0, float(out_us) / float(total_us)))
+                pct = int(round(p * 100))
+                if (not force) and pct == last_emit_pct and (now - last_emit_at) < 1.0:
+                    return
+                eta = None
+                elapsed = now - start_ts
+                if p > 0.01 and elapsed >= 1.0:
+                    eta = elapsed * (1.0 / p - 1.0)
+                msg = f"🔀 MUX {pct}%"
+                if eta is not None and eta < 48 * 3600:
+                    msg += f" ETA {_fmt_hms(eta)}"
+                try:
+                    status_cb(msg)
+                except Exception:
+                    pass
+                last_emit_pct = pct
+                last_emit_at = now
+            except Exception:
+                pass
+
+        proc = sp.Popen(
+            cmd,
+            stdout=sp.PIPE,
+            stderr=sp.STDOUT,
+            stdin=sp.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        def _reader():
+            nonlocal out_us
+            try:
+                with open(log_path, "w", encoding="utf-8") as log:
+                    if not proc.stdout:
+                        return
+                    for raw in proc.stdout:
+                        try:
+                            log.write(raw)
+                        except Exception:
+                            pass
+
+                        if not status_cb or not total_us:
+                            continue
+
+                        line = (raw or "").strip()
+                        if "=" not in line:
+                            continue
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip()
+                        if key == "out_time_ms":
+                            # Исторически ffmpeg пишет microseconds в out_time_ms.
+                            try:
+                                out_us = int(val)
+                            except Exception:
+                                out_us = None
+                            _emit_mux_progress()
+                        elif key == "out_time":
+                            parsed = _parse_hhmmss_us(val)
+                            if parsed is not None:
+                                out_us = parsed
+                                _emit_mux_progress()
+                        elif key == "progress" and val == "end":
+                            out_us = total_us
+                            _emit_mux_progress(force=True)
+            except Exception:
+                pass
+
+        reader_th = threading.Thread(target=_reader, daemon=True)
+        reader_th.start()
+
         while True:
             rc = proc.poll()
             if rc is not None:
+                try:
+                    reader_th.join(timeout=1.0)
+                except Exception:
+                    pass
                 return rc
             if _is_cancelled(cancel_event):
                 try:
@@ -123,12 +323,22 @@ def _run_ffmpeg(cmd, cancel_event=None) -> int:
                         proc.wait(timeout=3)
                     except Exception:
                         pass
+                try:
+                    reader_th.join(timeout=1.0)
+                except Exception:
+                    pass
                 return -2
             time.sleep(0.2)
 
     except Exception as e:
         print(f"⚠️ Ошибка запуска ffmpeg: {e}")
         return -1
+    finally:
+        if mux_acquired:
+            try:
+                _MUX_SEMA.release()
+            except Exception:
+                pass
 
 
 from urllib.parse import quote_plus
@@ -200,20 +410,47 @@ def _has_challenge(driver) -> bool:
     try:
         url = (driver.current_url or "").lower()
         html = (driver.page_source or "").lower()
+        title = (getattr(driver, "title", "") or "").lower()
     except Exception:
         return False
-    needles = (
-        "captcha",
+
+    # Важно: не используем общий needle "cloudflare", потому что он часто встречается на обычных страницах
+    # (например, Cloudflare Insights beacon) и даёт ложные срабатывания.
+
+    url_needles = (
+        "/cdn-cgi/",
+        "cf_chl",
+        "cf-captcha",
+        "challenge-platform",
+        "chk_captcha",
+        "chk_jschl",
+    )
+    if any(n in url for n in url_needles):
+        return True
+
+    title_needles = (
+        "just a moment",
+        "checking your browser",
+        "attention required",
+    )
+    if any(n in title for n in title_needles):
+        return True
+
+    html_needles = (
+        "/cdn-cgi/challenge-platform/",
+        "cf-challenge",
+        "cf_chl_",
+        "cf-please-wait",
+        "cf-turnstile",
+        "challenges.cloudflare.com/turnstile/",
         "g-recaptcha",
         "hcaptcha",
-        "cloudflare",
-        "cf-challenge",
-        "cf-browser-verification",
-        "/cdn-cgi/challenge-platform/",
+        "data-sitekey",
+        "just a moment",
+        "checking your browser",
+        "attention required",
     )
-    if any(n in url for n in needles):
-        return True
-    if any(n in html for n in needles):
+    if any(n in html for n in html_needles):
         return True
     try:
         return bool(
@@ -249,6 +486,90 @@ def _wait_challenge_solved(driver, timeout: int = 30) -> bool:
 
     # челлендж не ушёл — оставим окно раскрытым, чтобы пользователь мог дорешать
     return False
+
+
+def _driver_is_suppressed(driver) -> bool:
+    """
+    Драйвер запущен в suppress=True (окно агрессивно прячется хуками win32),
+    поэтому показать его пользователю для решения Cloudflare невозможно.
+    """
+    try:
+        return bool(getattr(driver, "_win_event_hooks", None))
+    except Exception:
+        return False
+
+
+def _solve_cloudflare_in_visible_browser(url: str, *, status_cb=None, timeout: int = 180) -> bool:
+    """
+    Открывает видимый браузер (профиль login), чтобы пользователь прошёл Cloudflare/капчу.
+    После успешного прохождения сохраняет cookies в файл.
+    """
+    with _CF_SOLVE_LOCK:
+        try:
+            if status_cb:
+                status_cb("🌐 Открываю браузер для прохождения Cloudflare…")
+        except Exception:
+            pass
+
+        drv = None
+        try:
+            # ВАЖНО: импорт внутри, чтобы не ловить циклические импорты (uc_driver -> kino_hls).
+            from uc_driver import _safe_get_driver, KINOPUB_BASE
+            from kino_parser import load_cookies, save_cookies, safe_quit
+
+            drv = _safe_get_driver(
+                status_cb=status_cb,
+                suppress=False,              # окно ДОЛЖНО быть видимым
+                profile_tag="login",         # постоянный профиль: легче пройти CF один раз
+                preload_kino_cookies=False,  # для login профиля подгрузим сами
+            )
+
+            # Подгружаем cookies (если есть) и обновляем страницу
+            try:
+                drv.get(KINOPUB_BASE + "/")
+            except Exception:
+                pass
+            try:
+                load_cookies(drv)
+                drv.refresh()
+            except Exception:
+                pass
+
+            try:
+                drv.get(url)
+            except Exception:
+                pass
+
+            _wait_challenge_solved(drv, timeout=int(timeout))
+            if _has_challenge(drv):
+                try:
+                    if status_cb:
+                        status_cb("❌ Защита Cloudflare не пройдена (таймаут)")
+                except Exception:
+                    pass
+                return False
+
+            try:
+                save_cookies(drv)
+            except Exception:
+                pass
+
+            try:
+                if status_cb:
+                    status_cb("✅ Cloudflare пройден, продолжаю…")
+            except Exception:
+                pass
+            return True
+        finally:
+            try:
+                if drv is not None:
+                    safe_quit(drv)
+            except Exception:
+                try:
+                    if drv is not None:
+                        drv.quit()
+                except Exception:
+                    pass
 
 FFMPEG_BIN = r"C:\Project\MovieYearFinder\ffmpeg\bin\ffmpeg.exe"
 print("[FFMPEG USED]", FFMPEG_BIN)
@@ -1171,7 +1492,16 @@ def search_first_item_url(driver, title_query: str) -> str | None:
             continue
 
 
-def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None, cancel_event=None) -> bool:
+def download_by_item_url(
+    url: str,
+    out_path: str,
+    driver=None,
+    status_cb=None,
+    cancel_event=None,
+    audio_select_cb=None,
+    defer_mux: bool = False,
+    audio_parallel_tracks: int | None = None,
+) -> bool:
     """
     Основная функция скачивания: использует существующий driver, не создавая новое окно Chrome.
     """
@@ -1195,7 +1525,12 @@ def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None, c
             _ensure_shown(drv)
 
         # --- ЕДИНСТВЕННЫЙ вызов, без двойной нагрузки ---
-        video_m3u8, hdrs2, audios = get_hls_info(url, driver=drv, cancel_event=cancel_event)
+        video_m3u8, hdrs2, audios = get_hls_info(
+            url,
+            driver=drv,
+            cancel_event=cancel_event,
+            status_cb=status_cb,
+        )
 
         if not video_m3u8:
             print("❌ Не удалось получить HLS.")
@@ -1216,6 +1551,9 @@ def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None, c
             out_path,
             status_cb=status_cb,
             cancel_event=cancel_event,
+            audio_select_cb=audio_select_cb,
+            defer_mux=defer_mux,
+            audio_parallel_tracks=audio_parallel_tracks,
         )
         return bool(ok)
 
@@ -1226,7 +1564,13 @@ def download_by_item_url(url: str, out_path: str, driver=None, status_cb=None, c
         if drv_created:
             from kino_parser import safe_quit
             safe_quit(drv)
-def get_hls_info(url: str, driver=None, cancel_event=None) -> tuple[str | None, dict | None, list]:
+def get_hls_info(
+    url: str,
+    driver=None,
+    cancel_event=None,
+    status_cb=None,
+    sniff_timeout: int = 15,
+) -> tuple[str | None, dict | None, list]:
     """
     Возвращает (video_m3u8, headers, audios) для данного item_url.
     Не запускает ffmpeg, просто извлекает ссылки.
@@ -1234,26 +1578,122 @@ def get_hls_info(url: str, driver=None, cancel_event=None) -> tuple[str | None, 
     if driver is None:
         raise RuntimeError("get_hls_info() требует активный driver (UC).")
 
+    def _log_local(msg: str):
+        try:
+            print(msg)
+        except Exception:
+            pass
+        if status_cb:
+            try:
+                status_cb(msg)
+            except Exception:
+                pass
+
+    def _ensure_cf_solved() -> bool:
+        # Cloudflare/капча: для suppress-драйвера открываем отдельное видимое окно.
+        if not _has_challenge(driver):
+            return True
+
+        _log_local("🧩 Обнаружена защита (Cloudflare) — решите в открытом браузере…")
+
+        # 1) если драйвер умеет показываться — ждём прямо в нём
+        if not _driver_is_suppressed(driver):
+            _wait_challenge_solved(driver, timeout=90)
+            return not _has_challenge(driver)
+
+        # 2) suppress-драйвер не показать: возможно, другой поток уже обновил cookies — пробуем подгрузить/refresh
+        try:
+            from kino_parser import load_cookies
+
+            load_cookies(driver)
+            driver.refresh()
+        except Exception:
+            pass
+
+        if not _has_challenge(driver):
+            return True
+
+        # 3) открываем видимый браузер, сохраняем cookies, обновляем текущий драйвер
+        ok = _solve_cloudflare_in_visible_browser(url, status_cb=status_cb, timeout=180)
+        if not ok:
+            return False
+
+        try:
+            from kino_parser import load_cookies
+
+            load_cookies(driver)
+            driver.refresh()
+        except Exception:
+            pass
+
+        return not _has_challenge(driver)
+
     _raise_if_cancelled(cancel_event)
     driver.get(url)
-    _wait_challenge_solved(driver, timeout=25)
-    WebDriverWait(driver, 20).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
 
-    _inject_m3u8_sniffer_js(driver)
-    _start_playback(driver)
-    for _ in range(10):
+    # CF/капча: ждём и не продолжаем, пока защита не пройдена (иначе получим «не найден m3u8»)
+    if not _ensure_cf_solved():
+        _log_local("❌ Защита Cloudflare не пройдена (таймаут)")
+        return None, None, []
+
+    try:
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        pass
+
+    try:
+        if "/user/login" in (driver.current_url or "").lower():
+            _log_local("❌ Требуется вход в kino.pub")
+            return None, None, []
+    except Exception:
+        pass
+
+    master, hdrs = None, None
+    # Небольшой внутренний ретрай: иногда CDP/хуки не успевают поймать запросы сразу.
+    for attempt in range(1, 3):
         _raise_if_cancelled(cancel_event)
-        time.sleep(0.2)
+        if attempt > 1:
+            _log_local(f"♻️ Повтор анализа HLS ({attempt}/2)…")
+            try:
+                driver.refresh()
+            except Exception:
+                try:
+                    driver.get(url)
+                except Exception:
+                    pass
 
-    master, hdrs = _sniff_hls_with_cdp(driver, timeout=10, cancel_event=cancel_event)
+            if not _ensure_cf_solved():
+                _log_local("❌ Защита Cloudflare не пройдена (таймаут)")
+                return None, None, []
+
+            try:
+                WebDriverWait(driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+
+        _inject_m3u8_sniffer_js(driver)
+        _start_playback(driver)
+        # даём плееру время дернуть master.m3u8
+        for _ in range(12):
+            _raise_if_cancelled(cancel_event)
+            time.sleep(0.2)
+
+        master, hdrs = _sniff_hls_with_cdp(
+            driver, timeout=max(8, int(sniff_timeout)), cancel_event=cancel_event
+        )
+        if master:
+            break
+
     if master:
         master = _normalize_to_master(master)
         master = master.replace(".mp4master.m3u8", ".mp4/master.m3u8")
         print(f"🛠️ Нормализовано: {master}")
     else:
-        print("❌ Не найден master.m3u8")
+        _log_local("❌ Не найден master.m3u8")
         return None, None, []
 
     video_m3u8, hdrs2, audios = _select_video_and_audios(driver, master, hdrs, cancel_event=cancel_event)
@@ -1581,23 +2021,59 @@ def _http_download(url: str, headers: dict, attempt=1, max_tries=50, cancel_even
         ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
 
     req = urllib.request.Request(url, headers=hdict)
+    last_err = None
+    last_code = None
+    forbidden_streak = 0
 
     for i in range(1, max_tries + 1):
         _raise_if_cancelled(cancel_event)
         try:
-            with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
-                if 200 <= r.status < 300:
-                    return r.read()
-        except Exception:
-            pass
-        _raise_if_cancelled(cancel_event)
-        time.sleep(min(0.2 * i, 2))
+            with _HLS_SEGMENT_SEMA:
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+                    code = int(getattr(r, "status", 200) or 0)
+                    if 200 <= code < 300:
+                        return r.read()
+                    last_code = code
+                    last_err = RuntimeError(f"HTTP {code}")
+        except urllib.error.HTTPError as e:
+            last_code = int(getattr(e, "code", 0) or 0)
+            last_err = e
+        except Exception as e:
+            last_code = None
+            last_err = e
 
-    raise RuntimeError(f"SEGMENT FAIL: {url}")
+        _raise_if_cancelled(cancel_event)
+
+        # если постоянно 401/403 — токен/куки могли протухнуть, бессмысленно ждать 50 попыток
+        if last_code in (401, 403):
+            forbidden_streak += 1
+        else:
+            forbidden_streak = 0
+
+        if forbidden_streak >= 8:
+            break
+
+        # backoff + jitter (429/5xx дольше)
+        base_sleep = 0.25 * i
+        if last_code == 429:
+            base_sleep = 0.8 * i
+            try:
+                ra = getattr(last_err, "headers", None)
+                ra = ra.get("Retry-After") if ra else None
+                if ra:
+                    base_sleep = max(base_sleep, float(ra))
+            except Exception:
+                pass
+        elif isinstance(last_code, int) and last_code >= 500:
+            base_sleep = 0.6 * i
+
+        time.sleep(min(base_sleep, 6.0) + random.uniform(0.0, 0.35))
+
+    raise RuntimeError(f"SEGMENT FAIL ({last_code or last_err}): {url}")
 
 
 def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
-                         status_cb=None, label="Видео", workers=8, cancel_event=None):
+                          status_cb=None, label="Видео", workers=8, cancel_event=None):
     """
     Скачивает HLS-видео/аудио в mp4, БЕЗ ffmpeg.
     """
@@ -1625,8 +2101,8 @@ def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
         print("❌ Нет сегментов!")
         return False
 
-    # скачиваем параллельно (с кооперативной отменой)
-    data = [None] * len(segments)
+    # скачиваем параллельно (с кооперативной отменой), но пишем на диск ПО МЕРЕ готовности,
+    # чтобы не держать весь файл в RAM (важно для стабильности при параллельных загрузках).
     total = len(segments)
     done_cnt = 0
     last_pct = -1
@@ -1663,70 +2139,92 @@ def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
 
     def load(i, url):
         chunk = _http_download(url, headers, cancel_event=cancel_event)
-        data[i] = chunk
-        try:
-            return len(chunk)
-        except Exception:
-            return 0
+        return i, chunk
 
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     pending = set()
     shutdown_wait = True
+    tmp = out_path + ".part"
     try:
-        for i, url in enumerate(segments):
+        for i, seg_url in enumerate(segments):
             _raise_if_cancelled(cancel_event)
-            pending.add(ex.submit(load, i, url))
+            pending.add(ex.submit(load, i, seg_url))
 
-        while pending:
-            done, pending = concurrent.futures.wait(
-                pending,
-                timeout=0.2,
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-            for f in done:
-                try:
-                    bytes_done += int(f.result() or 0)
-                except Exception:
-                    # если исключение в сегменте — пробросится ниже
-                    f.result()
-            done_cnt += len(done)
-            if status_cb and total > 0:
-                try:
-                    pct = int(done_cnt * 100 / total)
-                    pct = max(0, min(100, pct))
-                    now = time.time()
-                    if pct >= 100 or pct - last_pct >= 5 or (now - last_ts) >= 1.2:
-                        last_pct = pct
-                        last_ts = now
-                        speed = ""
-                        eta_txt = ""
-                        try:
-                            elapsed = max(0.25, now - start_ts)
-                            speed = _fmt_speed(bytes_done / elapsed) if bytes_done > 0 else ""
-                            if 0 < done_cnt < total:
-                                eta_txt = _fmt_eta((total - done_cnt) * (elapsed / max(1, done_cnt)))
-                        except Exception:
+        pending_chunks = {}
+        next_write = 0
+
+        with open(tmp, "wb") as f_out:
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=0.2,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+                for fut in done:
+                    try:
+                        idx, chunk = fut.result()
+                    except Exception:
+                        # если исключение в сегменте — пробросится ниже
+                        fut.result()
+                        continue
+                    pending_chunks[int(idx)] = chunk
+                    try:
+                        bytes_done += int(len(chunk) if chunk is not None else 0)
+                    except Exception:
+                        pass
+
+                done_cnt += len(done)
+
+                # пишем на диск строго по порядку сегментов
+                while next_write in pending_chunks:
+                    _raise_if_cancelled(cancel_event)
+                    f_out.write(pending_chunks.pop(next_write))
+                    next_write += 1
+
+                if status_cb and total > 0:
+                    try:
+                        pct = int(done_cnt * 100 / total)
+                        pct = max(0, min(100, pct))
+                        now = time.time()
+                        if pct >= 100 or pct - last_pct >= 5 or (now - last_ts) >= 1.2:
+                            last_pct = pct
+                            last_ts = now
                             speed = ""
                             eta_txt = ""
-                        if speed:
-                            if eta_txt:
-                                status_cb(f"⬇️ {label} {pct}% ({speed}, ETA {eta_txt})")
+                            try:
+                                elapsed = max(0.25, now - start_ts)
+                                speed = _fmt_speed(bytes_done / elapsed) if bytes_done > 0 else ""
+                                if 0 < done_cnt < total:
+                                    eta_txt = _fmt_eta((total - done_cnt) * (elapsed / max(1, done_cnt)))
+                            except Exception:
+                                speed = ""
+                                eta_txt = ""
+                            if speed:
+                                if eta_txt:
+                                    status_cb(f"⬇️ {label} {pct}% ({speed}, ETA {eta_txt})")
+                                else:
+                                    status_cb(f"⬇️ {label} {pct}% ({speed})")
                             else:
-                                status_cb(f"⬇️ {label} {pct}% ({speed})")
-                        else:
-                            if eta_txt:
-                                status_cb(f"⬇️ {label} {pct}% (ETA {eta_txt})")
-                            else:
-                                status_cb(f"⬇️ {label} {pct}%")
-                except Exception:
-                    pass
-            _raise_if_cancelled(cancel_event)
+                                if eta_txt:
+                                    status_cb(f"⬇️ {label} {pct}% (ETA {eta_txt})")
+                                else:
+                                    status_cb(f"⬇️ {label} {pct}%")
+                    except Exception:
+                        pass
+
+                _raise_if_cancelled(cancel_event)
 
     except DownloadCancelled:
         shutdown_wait = False
         for f in pending:
             f.cancel()
         ex.shutdown(wait=False, cancel_futures=True)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
         return False
 
     except Exception:
@@ -1734,6 +2232,11 @@ def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
         for f in pending:
             f.cancel()
         ex.shutdown(wait=False, cancel_futures=True)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
         raise
 
     finally:
@@ -1756,14 +2259,15 @@ def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
     except Exception:
         pass
 
-    # сохраняем склейку
-    tmp = out_path + ".part"
+    # атомарно публикуем результат
     try:
-        with open(tmp, "wb") as f:
-            for chunk in data:
-                if _is_cancelled(cancel_event):
-                    return False
-                f.write(chunk)
+        if _is_cancelled(cancel_event):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False
         os.replace(tmp, out_path)
     finally:
         if os.path.exists(tmp):
@@ -1775,7 +2279,17 @@ def _download_hls_stream(m3u8_url: str, headers: dict, out_path: str,
     print(f"{label} скачано")
     return True
 
-def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None, cancel_event=None):
+def start_hls_download(
+    video_m3u8,
+    audios,
+    headers,
+    out_path,
+    status_cb=None,
+    cancel_event=None,
+    audio_select_cb=None,
+    defer_mux: bool = False,
+    audio_parallel_tracks: int | None = None,
+):
     """
     Стойкий режим:
     1) Python скачивает VIDEO HLS (без ffmpeg)
@@ -1787,6 +2301,8 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None, ca
         tmp_dir = out_path + ".parts"
         os.makedirs(tmp_dir, exist_ok=True)
         tmp_out = None
+        mux_started = False
+        mux_ok = False
 
         try:
             _raise_if_cancelled(cancel_event)
@@ -1795,27 +2311,7 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None, ca
             audio_files = []
             audio_meta = []
 
-            # --- VIDEO ---
-            print("🎞 Скачиваю видео...")
-            ok = _download_hls_stream(
-                video_m3u8,
-                headers,
-                video_file,
-                status_cb,
-                "Видео",
-                cancel_event=cancel_event,
-            )
-            if not ok:
-                if _is_cancelled(cancel_event):
-                    return False
-                if status_cb:
-                    status_cb("❌ Ошибка видео")
-                return False
-
-            _raise_if_cancelled(cancel_event)
-
-            # --- AUDIO ---
-            print("🎧 Скачиваю аудио...")
+            # --- AUDIO список (нужен для проверки кеша и повторов) ---
             audios_valid = []
             try:
                 for a in (audios or []):
@@ -1829,6 +2325,89 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None, ca
                 audios_valid = list(audios or [])
 
             total_audio = len(audios_valid)
+            audio_uris = []
+            try:
+                for a in audios_valid:
+                    try:
+                        url = a.get("uri") or a.get("url")
+                    except Exception:
+                        url = None
+                    if url:
+                        audio_uris.append(str(url))
+            except Exception:
+                audio_uris = []
+
+            def _file_ok(p: str) -> bool:
+                try:
+                    return os.path.isfile(p) and os.path.getsize(p) > 0
+                except Exception:
+                    return False
+
+            # если в mux_meta.json есть сигнатура (m3u8 + список аудио) и она НЕ совпадает —
+            # значит .parts от другого источника, лучше скачать заново
+            force_redownload = False
+            try:
+                import json
+
+                mux_meta_path = os.path.join(tmp_dir, "mux_meta.json")
+                if os.path.isfile(mux_meta_path):
+                    with open(mux_meta_path, "r", encoding="utf-8") as f:
+                        old = json.load(f) or {}
+                    old_v = old.get("video_m3u8")
+                    old_a = old.get("audio_uris")
+                    if isinstance(old_v, str) and isinstance(old_a, list):
+                        if old_v != str(video_m3u8) or [str(x) for x in old_a] != audio_uris:
+                            force_redownload = True
+            except Exception:
+                pass
+
+            # --- VIDEO ---
+            video_cached = (not force_redownload) and _file_ok(video_file)
+            if video_cached:
+                try:
+                    print("♻️ Видео уже скачано — пропускаю.")
+                    if status_cb:
+                        status_cb("♻️ Видео уже скачано")
+                except Exception:
+                    pass
+            else:
+                print("🎞 Скачиваю видео...")
+                ok = _download_hls_stream(
+                    video_m3u8,
+                    headers,
+                    video_file,
+                    status_cb,
+                    "Видео",
+                    cancel_event=cancel_event,
+                )
+                if not ok:
+                    if _is_cancelled(cancel_event):
+                        return False
+                    if status_cb:
+                        status_cb("❌ Ошибка видео")
+                    return False
+
+            _raise_if_cancelled(cancel_event)
+
+            # --- AUDIO ---
+            print("🎧 Скачиваю аудио...")
+            try:
+                ap = int(audio_parallel_tracks or 1)
+            except Exception:
+                ap = 1
+            ap = max(1, min(4, ap))
+
+            # При параллели уменьшаем число воркеров на поток, чтобы не взрывать количество тредов.
+            try:
+                audio_seg_workers = 8 if ap <= 1 else 4
+            except Exception:
+                audio_seg_workers = 8
+
+            # Собираем задания и заранее учитываем уже скачанные файлы.
+            audio_slots: list[str | None] = [None] * max(0, int(total_audio))
+            audio_meta_slots: list[tuple[str, str] | None] = [None] * max(0, int(total_audio))
+            tasks: list[tuple[int, str, str, str, str, str]] = []  # (idx, url, apath, label, title, lang)
+
             for idx, a in enumerate(audios_valid, start=1):
                 _raise_if_cancelled(cancel_event)
                 url = a.get("uri") or a.get("url")
@@ -1843,21 +2422,178 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None, ca
                 if title:
                     label += f" ({title})"
 
-                ok = _download_hls_stream(
-                    url,
-                    headers,
-                    apath,
-                    status_cb,
-                    label,
-                    cancel_event=cancel_event,
-                )
-                if ok:
-                    audio_files.append(apath)
-                    audio_meta.append((title, lang))
-                elif _is_cancelled(cancel_event):
-                    return False
+                # если этот аудиофайл уже есть — не качаем повторно
+                if (not force_redownload) and _file_ok(apath):
+                    try:
+                        if status_cb:
+                            status_cb(f"♻️ {label} уже скачано")
+                    except Exception:
+                        pass
+                    if 0 <= idx - 1 < len(audio_slots):
+                        audio_slots[idx - 1] = apath
+                        audio_meta_slots[idx - 1] = (title, lang)
+                    continue
+
+                tasks.append((idx, str(url), apath, label, str(title), str(lang),))
+
+            # Если параллель отключена — скачиваем как раньше (последовательно).
+            if ap <= 1 or len(tasks) <= 1:
+                for idx, url, apath, label, title, lang in tasks:
+                    _raise_if_cancelled(cancel_event)
+                    ok = _download_hls_stream(
+                        url,
+                        headers,
+                        apath,
+                        status_cb,
+                        label,
+                        workers=audio_seg_workers,
+                        cancel_event=cancel_event,
+                    )
+                    if ok:
+                        if 0 <= idx - 1 < len(audio_slots):
+                            audio_slots[idx - 1] = apath
+                            audio_meta_slots[idx - 1] = (title, lang)
+                    elif _is_cancelled(cancel_event):
+                        return False
+            else:
+                # Параллельно по N аудиодорожек (ускоряет тайтлы с 10–20 дорожками).
+                ex = concurrent.futures.ThreadPoolExecutor(max_workers=ap)
+                fut_map: dict[concurrent.futures.Future, tuple[int, str, str, str, str]] = {}
+                try:
+                    for idx, url, apath, label, title, lang in tasks:
+                        _raise_if_cancelled(cancel_event)
+                        fut = ex.submit(
+                            _download_hls_stream,
+                            url,
+                            headers,
+                            apath,
+                            status_cb,
+                            label,
+                            audio_seg_workers,
+                            cancel_event,
+                        )
+                        fut_map[fut] = (idx, apath, title, lang, label)
+
+                    pending = set(fut_map.keys())
+                    while pending:
+                        _raise_if_cancelled(cancel_event)
+                        done, pending = concurrent.futures.wait(
+                            pending,
+                            timeout=0.25,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for fut in done:
+                            idx, apath, title, lang, _label = fut_map.get(fut, (0, "", "", "und", ""))
+                            ok = fut.result()  # может выбросить исключение как и раньше
+                            if ok:
+                                if 0 <= idx - 1 < len(audio_slots):
+                                    audio_slots[idx - 1] = apath
+                                    audio_meta_slots[idx - 1] = (title, lang)
+                            elif _is_cancelled(cancel_event):
+                                # дадим остальным потокам корректно завершиться по cancel_event
+                                return False
+                finally:
+                    try:
+                        ex.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        try:
+                            ex.shutdown(wait=False)
+                        except Exception:
+                            pass
+
+            # Собираем в исходном порядке (важно для map в ffmpeg).
+            for i in range(min(len(audio_slots), len(audio_meta_slots))):
+                p = audio_slots[i]
+                meta = audio_meta_slots[i]
+                if p and meta:
+                    audio_files.append(p)
+                    audio_meta.append(meta)
 
             _raise_if_cancelled(cancel_event)
+
+            # Сохраним метаданные для возможного «Повторить MUX» (если ffmpeg упадёт).
+            try:
+                import json
+
+                mux_meta_path = os.path.join(tmp_dir, "mux_meta.json")
+                meta = {
+                    "video_file": os.path.basename(video_file),
+                    "audio_files": [os.path.basename(p) for p in audio_files],
+                    "audio_meta": list(audio_meta),
+                    "video_m3u8": str(video_m3u8),
+                    "audio_uris": list(audio_uris),
+                }
+                try:
+                    all_audio_ok = True
+                    for i in range(1, total_audio + 1):
+                        if not _file_ok(os.path.join(tmp_dir, f"audio_{i}.aac")):
+                            all_audio_ok = False
+                            break
+                    meta["complete"] = bool(_file_ok(video_file) and (all_audio_ok or total_audio == 0))
+                except Exception:
+                    pass
+                with open(mux_meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            # --- DEFER MUX (manual convert) ---
+            if defer_mux:
+                try:
+                    if status_cb:
+                        status_cb("🎞 Готово к конвертации")
+                except Exception:
+                    pass
+                return True
+
+            # --- AUDIO SELECT (optional, before MUX) ---
+            try:
+                if callable(audio_select_cb) and len(audio_files) > 1 and (not _is_cancelled(cancel_event)):
+                    try:
+                        if status_cb:
+                            status_cb("🎧 Выбор аудиодорожки…")
+                    except Exception:
+                        pass
+
+                    try:
+                        choice = audio_select_cb(
+                            out_path=out_path,
+                            video_file=video_file,
+                            audio_files=list(audio_files),
+                            audio_meta=list(audio_meta),
+                            cancel_event=cancel_event,
+                            status_cb=status_cb,
+                        )
+                    except Exception:
+                        choice = None
+
+                    if _is_cancelled(cancel_event):
+                        return False
+
+                    # Важно: 0 == False, поэтому проверяем именно bool False, а не "любое равное False".
+                    if choice == "cancel" or choice is False:
+                        return False
+
+                    idxs = None
+                    if isinstance(choice, int):
+                        idxs = [choice]
+                    elif isinstance(choice, (list, tuple, set)):
+                        idxs = list(choice)
+
+                    if idxs:
+                        norm: list[int] = []
+                        for x in idxs:
+                            try:
+                                norm.append(int(x))
+                            except Exception:
+                                continue
+                        # ожидаем 0-based индексы
+                        norm = sorted({i for i in norm if 0 <= i < len(audio_files)})
+                        if norm:
+                            audio_files = [audio_files[i] for i in norm]
+                            audio_meta = [audio_meta[i] for i in norm if i < len(audio_meta)]
+            except Exception:
+                pass
 
             # --- MUX ---
             base, _ = os.path.splitext(out_path)
@@ -1941,12 +2677,14 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None, ca
             print("MUX CMD:", " ".join(cmd_quoted))
 
             _raise_if_cancelled(cancel_event)
-            rc = _run_ffmpeg(cmd, cancel_event=cancel_event)
+            mux_started = True
+            rc = _run_ffmpeg(cmd, cancel_event=cancel_event, status_cb=status_cb)
             if _is_cancelled(cancel_event):
                 return False
 
             if rc == 0 and os.path.exists(tmp_out):
                 os.replace(tmp_out, out_path)
+                mux_ok = True
                 print("✅ Готово!", out_path)
                 if status_cb:
                     status_cb(f"✅ {os.path.basename(out_path)}")
@@ -1966,9 +2704,245 @@ def start_hls_download(video_m3u8, audios, headers, out_path, status_cb=None, ca
                     os.remove(tmp_out)
                 except Exception:
                     pass
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            # Если упал только MUX — смысла качать сегменты заново нет: сохраняем .parts,
+            # чтобы пользователь мог нажать «Повторить MUX».
+            keep_parts = False
+            try:
+                keep_on_cancel = False
+                try:
+                    keep_on_cancel = bool(getattr(cancel_event, "_keep_parts", False))
+                except Exception:
+                    keep_on_cancel = False
+
+                if (not mux_ok) and (keep_on_cancel or (not _is_cancelled(cancel_event))):
+                    if mux_started:
+                        keep_parts = True
+                    else:
+                        # если что-то уже скачали (например, video.ts) — оставим, чтобы не качать повторно
+                        try:
+                            if os.path.isfile(video_file) and os.path.getsize(video_file) > 0:
+                                keep_parts = True
+                            else:
+                                for fn in os.listdir(tmp_dir):
+                                    if not (fn.startswith("audio_") and fn.endswith(".aac")):
+                                        continue
+                                    p = os.path.join(tmp_dir, fn)
+                                    try:
+                                        if os.path.isfile(p) and os.path.getsize(p) > 0:
+                                            keep_parts = True
+                                            break
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            pass
+            except Exception:
+                keep_parts = False
+
+            if not keep_parts:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return worker()
+
+
+def retry_mux(out_path: str, status_cb=None, cancel_event=None, audio_select_cb=None) -> bool | str:
+    """
+    Повторяет ТОЛЬКО стадию MUX, используя уже скачанные файлы в папке `{out_path}.parts`.
+    Полезно, когда ffmpeg упал, но сегменты уже скачаны.
+    """
+    tmp_dir = out_path + ".parts"
+    if not os.path.isdir(tmp_dir):
+        if status_cb:
+            status_cb("❌ Нет данных для MUX (.parts не найден)")
+        return False
+
+    meta_path = os.path.join(tmp_dir, "mux_meta.json")
+    video_file = os.path.join(tmp_dir, "video.ts")
+    audio_files: list[str] = []
+    audio_meta: list[tuple[str, str]] = []
+
+    try:
+        if os.path.isfile(meta_path):
+            import json
+
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f) or {}
+            try:
+                vf = str(meta.get("video_file") or "").strip()
+                if vf:
+                    video_file = os.path.join(tmp_dir, vf)
+            except Exception:
+                pass
+            try:
+                audio_files = [
+                    os.path.join(tmp_dir, str(p))
+                    for p in (meta.get("audio_files") or [])
+                    if str(p).strip()
+                ]
+            except Exception:
+                audio_files = []
+            try:
+                raw_meta = meta.get("audio_meta") or []
+                audio_meta = [(str(t or ""), str(l or "und")) for t, l in raw_meta]
+            except Exception:
+                audio_meta = []
+    except Exception:
+        pass
+
+    if not os.path.isfile(video_file):
+        if status_cb:
+            status_cb("❌ Нет video.ts для MUX")
+        return False
+
+    if not audio_files:
+        try:
+            # audio_1.aac, audio_2.aac...
+            cand = [os.path.join(tmp_dir, fn) for fn in os.listdir(tmp_dir) if fn.startswith("audio_") and fn.endswith(".aac")]
+            def _key(p: str):
+                bn = os.path.basename(p)
+                m = re.search(r"audio_(\d+)", bn)
+                return int(m.group(1)) if m else 10**9
+            audio_files = sorted([p for p in cand if os.path.isfile(p)], key=_key)
+        except Exception:
+            audio_files = []
+
+    # --- AUDIO SELECT (optional, before MUX) ---
+    try:
+        if callable(audio_select_cb) and len(audio_files) > 1 and (not _is_cancelled(cancel_event)):
+            try:
+                if status_cb:
+                    status_cb("🎧 Выбор аудиодорожки…")
+            except Exception:
+                pass
+
+            try:
+                choice = audio_select_cb(
+                    out_path=out_path,
+                    video_file=video_file,
+                    audio_files=list(audio_files),
+                    audio_meta=list(audio_meta),
+                    cancel_event=cancel_event,
+                    status_cb=status_cb,
+                )
+            except Exception:
+                choice = None
+
+            if _is_cancelled(cancel_event):
+                return False
+
+            # Важно: 0 == False, поэтому проверяем именно bool False, а не "любое равное False".
+            if choice == "cancel" or choice is False:
+                return "cancel"
+
+            idxs = None
+            if isinstance(choice, int):
+                idxs = [choice]
+            elif isinstance(choice, (list, tuple, set)):
+                idxs = list(choice)
+
+            if idxs:
+                norm: list[int] = []
+                for x in idxs:
+                    try:
+                        norm.append(int(x))
+                    except Exception:
+                        continue
+                # ожидаем 0-based индексы
+                norm = sorted({i for i in norm if 0 <= i < len(audio_files)})
+                if norm:
+                    audio_files = [audio_files[i] for i in norm]
+                    audio_meta = [audio_meta[i] for i in norm if i < len(audio_meta)]
+    except Exception:
+        pass
+
+    base, _ = os.path.splitext(out_path)
+    tmp_out = base + ".mp4.part"
+
+    # считаем битрейт (как в основном MUX)
+    total_kbps = TARGET_TOTAL_KBPS
+    audio_kbps = AUDIO_BITRATE_KBPS if audio_files else 0
+    video_kbps = max(MIN_VIDEO_BITRATE_KBPS, total_kbps - audio_kbps)
+    v_bitrate = f"{video_kbps}k"
+    a_bitrate = f"{audio_kbps}k" if audio_kbps else None
+    v_bufsize = f"{video_kbps * 2}k"
+
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", video_file]
+    for ap in audio_files:
+        cmd += ["-i", ap]
+
+    # Маппинг дорожек
+    cmd += ["-map", "0:v:0"]
+    for i in range(len(audio_files)):
+        cmd += ["-map", f"{i+1}:a:0"]
+
+    if ENABLE_REENCODE:
+        cmd += [
+            "-c:v", "h264_nvenc",
+            "-pix_fmt", "yuv420p",
+            "-preset", "p4",
+            "-profile:v", "high",
+            "-tune", "hq",
+            "-spatial_aq", "1",
+            "-temporal_aq", "1",
+            "-rc", "vbr_hq",
+            "-b:v", v_bitrate,
+            "-maxrate", v_bitrate,
+            "-bufsize", v_bufsize,
+        ]
+        if audio_files:
+            cmd += ["-c:a", "aac", "-b:a", a_bitrate]
+        else:
+            cmd += ["-an"]
+    else:
+        cmd += ["-c:v", "copy"]
+        if audio_files:
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-an"]
+
+    # метаданные по аудио (если есть)
+    try:
+        for i, (title, lang) in enumerate(audio_meta[: len(audio_files)]):
+            if title:
+                cmd += ["-metadata:s:a:{0}".format(i), f"title={title}"]
+            if lang:
+                cmd += ["-metadata:s:a:{0}".format(i), f"language={lang}"]
+    except Exception:
+        pass
+
+    if audio_files:
+        cmd += ["-disposition:a:0", "default"]
+
+    cmd += [
+        "-map_metadata", "-1",
+        "-sn",
+        "-movflags", "+faststart",
+        "-f", "mp4",
+        tmp_out,
+    ]
+
+    if status_cb:
+        status_cb("🟣 MUX…")
+
+    try:
+        _raise_if_cancelled(cancel_event)
+        rc = _run_ffmpeg(cmd, cancel_event=cancel_event, status_cb=status_cb)
+        if _is_cancelled(cancel_event):
+            return False
+        if rc == 0 and os.path.exists(tmp_out):
+            os.replace(tmp_out, out_path)
+            if status_cb:
+                status_cb(f"✅ {os.path.basename(out_path)}")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return True
+        if status_cb:
+            status_cb(f"❌ Ошибка MUX (код {rc})")
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
 
 
 
@@ -2005,4 +2979,4 @@ def download_one_title_ui(root, title_text: str, default_name: str | None = None
 
 def download_from_item_url(url: str, out_path: str) -> bool:
     # просто переиспользуем готовую реализацию
-    return download_by_item_url(url, out_path, status_cb=None) 
+    return download_by_item_url(url, out_path, driver=None, status_cb=None)

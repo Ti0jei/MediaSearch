@@ -4,6 +4,8 @@ import logging
 import tkinter as tk
 import shutil
 import json
+import secrets
+import socketserver
 import queue
 import subprocess
 import re
@@ -22,6 +24,7 @@ from threaded_tasks import threaded_save_checked
 from kino_pub_downloader import login_to_kino as real_login_to_kino
 from urllib.parse import urljoin, quote_plus   # <── ДОБАВИЛИ quote_plus
 import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import sys 
 # === НОВОЕ: Selenium для реального поиска ===
 import undetected_chromedriver as uc
@@ -443,6 +446,184 @@ def open_settings():
         wraplength=480,
         justify="left",
     ).pack(anchor="w", pady=(4, 0))
+
+    # --- BUILT-IN KINO.PUB ACCOUNT (NOT RECOMMENDED) ---
+    tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=10)
+
+    builtin_acc_var = tk.BooleanVar(value=bool(s.get("kino_use_builtin_account", False)))
+
+    def on_builtin_acc_toggle():
+        v = bool(builtin_acc_var.get())
+        ss = load_settings()
+        ss["kino_use_builtin_account"] = v
+        save_settings(ss)
+
+    tk.Checkbutton(
+        body,
+        text="Использовать встроенную учётную запись Kino.pub (не рекомендуется)",
+        variable=builtin_acc_var,
+        command=on_builtin_acc_toggle,
+        bg=BG_SURFACE,
+        fg=TEXT,
+        activebackground=BG_SURFACE,
+        activeforeground=TEXT,
+        selectcolor=BG_CARD,
+        highlightthickness=0,
+        bd=0,
+        font=("Segoe UI", 10),
+    ).pack(anchor="w")
+    tk.Label(
+        body,
+        text="Включайте только при необходимости: логин/пароль и резервный код будут автоматически заполнены на странице входа.",
+        bg=BG_SURFACE,
+        fg=SUBTEXT,
+        font=("Segoe UI", 9),
+        wraplength=480,
+        justify="left",
+    ).pack(anchor="w", pady=(4, 0))
+
+    def open_tm_instructions():
+        # Требуем активный логин в Kino.pub (иначе кнопка не работает)
+        try:
+            if not kino_logged_in:
+                show_login_required()
+                return
+        except Exception:
+            pass
+
+        token = ensure_bridge_token()
+        script = f"""// ==UserScript==
+// @name         Kino.pub -> Movie Tools
+// @namespace    movie-tools
+// @description  Отправка карточки Kino.pub в Movie Tools
+// @version      1.0.3
+// @match        https://kino.pub/*
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// ==/UserScript==
+
+(function () {{
+  const TOKEN = '{token}';
+  const ENDPOINT = 'http://127.0.0.1:47832/api/kino/add';
+
+  const BTN_CSS = `
+    .mt-dl-btn {{
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 10px 14px; margin-top: 8px;
+      background: linear-gradient(135deg, #2c3a4a 0%, #1f2835 100%);
+      color: #e8f5e1; border: 1px solid #2e3f50; border-radius: 10px;
+      font: 14px "Segoe UI", sans-serif; cursor: pointer;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+      transition: all 0.18s ease-in-out; text-decoration: none;
+    }}
+    .mt-dl-btn:hover {{
+      background: linear-gradient(135deg, #3c5c3c 0%, #2f4a31 100%);
+      border-color: #3fa46a; transform: translateY(-1px);
+      box-shadow: 0 8px 18px rgba(0,0,0,0.32);
+    }}
+    .mt-dl-btn:active {{ transform: translateY(0); box-shadow: 0 4px 12px rgba(0,0,0,0.25); }}
+    .mt-dl-btn .dot {{ width: 8px; height: 8px; border-radius: 50%; background: #3fa46a; box-shadow: 0 0 8px rgba(63,164,106,0.7); }}
+  `;
+  const style = document.createElement('style');
+  style.textContent = BTN_CSS;
+  document.head.appendChild(style);
+
+  function addButton(titleNode) {{
+    if (!titleNode || titleNode.dataset.mtBtn) return;
+    const btn = document.createElement('button');
+    btn.className = 'mt-dl-btn';
+    btn.innerHTML = '<span class="dot"></span><span>Скачать в Movie Tools</span>';
+    btn.onclick = () => {{
+      const title = (titleNode.innerText || document.title || '').trim();
+      GM_xmlhttpRequest({{
+        method: 'POST',
+        url: ENDPOINT,
+        headers: {{'Content-Type': 'application/json', 'X-Bridge-Token': TOKEN}},
+        data: JSON.stringify({{ url: location.href, title }}),
+        onload: (res) => {{
+          if (res.status === 200) alert('Отправлено в очередь');
+          else alert('Ошибка: ' + res.status + ' ' + (res.responseText || ''));
+        }},
+        onerror: (e) => alert('Не удалось отправить: ' + (e.error || 'net error')),
+        timeout: 5000,
+        ontimeout: () => alert('Таймаут запроса')
+      }});
+    }};
+    titleNode.dataset.mtBtn = '1';
+    titleNode.parentElement.insertBefore(btn, titleNode.nextSibling);
+  }}
+
+  function scan() {{
+    const node = document.querySelector('div.page-content h3');
+    if (node) addButton(node);
+  }}
+  scan();
+  const mo = new MutationObserver(scan);
+  mo.observe(document.body, {{ childList: true, subtree: true }});
+}})();
+"""
+        try:
+            downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        except Exception:
+            downloads = os.path.expanduser("~")
+        out_path = os.path.join(downloads, "kino_pub_movie_tools.user.js")
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(script)
+        except Exception as e:
+            messagebox.showerror("Расширение", f"Не удалось сохранить файл:\n{e}")
+            return
+
+        info = (
+            "Файл скрипта сохранён.\n\n"
+            f"1) Путь: {out_path}\n"
+            "2) Установите Tampermonkey: https://www.tampermonkey.net/\n"
+            "3) Откройте файл (двойной клик или через Tampermonkey → Создать новый → вставить содержимое) и сохраните.\n"
+            "4) Откройте карточку Kino.pub — кнопка «Скачать в Movie Tools» появится рядом с заголовком.\n\n"
+            "Токен уже подставлен автоматически."
+        )
+        try:
+            msg = tk.Toplevel(root)
+            msg.title("Расширение")
+            msg.configure(bg=BG_SURFACE, highlightbackground=BORDER, highlightthickness=1)
+            tk.Frame(msg, bg=ACCENT, height=2).pack(fill="x", side="top")
+            body = tk.Frame(msg, bg=BG_SURFACE)
+            body.pack(fill="both", expand=True, padx=12, pady=10)
+            tk.Label(body, text="Инструкция по расширению", font=("Segoe UI Semibold", 12),
+                     bg=BG_SURFACE, fg=TEXT).pack(anchor="w", pady=(0, 6))
+            txt = tk.Text(body, width=80, height=10, wrap="word", bg=BG_SURFACE, fg=TEXT,
+                          relief="flat", highlightthickness=1, highlightbackground=BORDER)
+            txt.pack(fill="both", expand=True)
+            txt.insert("1.0", info)
+            txt.configure(state="disabled")
+            link = tk.Label(body, text="Открыть Tampermonkey.net", fg=ACCENT, bg=BG_SURFACE,
+                            cursor="hand2", font=("Segoe UI", 10, "underline"))
+            link.pack(anchor="w", pady=(6, 0))
+            link.bind("<Button-1>", lambda _e: webbrowser.open("https://www.tampermonkey.net/"))
+            tk.Button(body, text="OK", command=msg.destroy, bg=BG_CARD, fg=TEXT,
+                      relief="flat", highlightthickness=1, highlightbackground=BORDER).pack(pady=(8, 2))
+            try:
+                msg.grab_set()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                messagebox.showinfo("Расширение", info)
+            except Exception:
+                pass
+        try:
+            os.startfile(out_path)
+        except Exception:
+            pass
+
+    btn_tm = tk.Button(body, text="Инструкция: расширение (Tampermonkey)", command=open_tm_instructions)
+    style_secondary(btn_tm)
+    btn_tm.pack(anchor="w", pady=(6, 0))
+    try:
+        if not kino_logged_in:
+            btn_tm.config(state="disabled")
+    except Exception:
+        pass
 
     # --- POPUP NOTIFICATIONS (BOTTOM-RIGHT) ---
     tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=10)
@@ -903,6 +1084,21 @@ def save_settings(data: dict):
 
 DOWNLOAD_HISTORY_KEY = "download_history"
 DOWNLOAD_HISTORY_MAX = 300
+
+def ensure_bridge_token() -> str:
+    try:
+        s = load_settings()
+    except Exception:
+        s = {}
+    tok = s.get("browser_bridge_token")
+    if not tok:
+        tok = secrets.token_hex(16)
+        s["browser_bridge_token"] = tok
+        try:
+            save_settings(s)
+        except Exception:
+            pass
+    return tok
 
 
 def get_download_history() -> list[dict]:
@@ -5222,7 +5418,7 @@ def main():
             pass
         if not item_out_dir:
             item_out_dir = out_dir
-        manager.start_item(item, url, item_out_dir)
+        _start_kino_item(item, url, item_out_dir)
 
     def retry_mux_selected():
         """Повторить только MUX (если остались {out_path}.parts после ошибки ffmpeg)."""
@@ -5436,7 +5632,7 @@ def main():
                 item_out_dir = out_dir
 
             try:
-                manager.start_item(iid, url, item_out_dir)
+                _start_kino_item(iid, url, item_out_dir)
             except Exception:
                 pass
 
@@ -5477,7 +5673,7 @@ def main():
                 item_out_dir = out_dir
 
             try:
-                manager.start_item(iid, url, item_out_dir)
+                _start_kino_item(iid, url, item_out_dir)
             except Exception:
                 pass
 
@@ -5655,7 +5851,7 @@ def main():
     btn_resume.config(command=resume_selected)
     btn_resume_all.config(command=resume_all)
     btn_convert.config(command=convert_selected)
-                  
+                   
     context_menu.add_command(label="Повторить / перезапустить загрузку",
                              command=retry_selected)
     context_menu.add_command(label="🎞 Конвертировать (MUX без докачки)",
@@ -5796,6 +5992,140 @@ def main():
         notify_cb=push_notification,
         history_cb=on_download_history_event,
     )
+
+    def _start_kino_item(item_id, url, out_dir, name_override=None):
+        """Запустить загрузку, только если есть вход в Kino.pub."""
+        global kino_logged_in
+        if not kino_logged_in:
+            show_login_required()
+            return False
+        try:
+            manager.start_item(item_id, url, out_dir, name_override=name_override)
+            return True
+        except Exception:
+            return False
+
+    # --- Browser bridge (Tampermonkey -> app) ---
+    def _start_browser_bridge():
+        try:
+            s = load_settings()
+        except Exception:
+            s = {}
+        enabled = bool(s.get("browser_bridge_enabled", True))
+        if not enabled:
+            return
+        token = s.get("browser_bridge_token") or ensure_bridge_token()
+        try:
+            port = int(s.get("browser_bridge_port") or 47832)
+        except Exception:
+            port = 47832
+
+        def _enqueue_from_bridge(url: str, title: str):
+            global kino_logged_in
+            if not kino_logged_in:
+                return False, "not_logged_in"
+            try:
+                item_id = add_row(title or url, status="🟡 Подготовка...")
+                try:
+                    if hasattr(manager, "url_by_item"):
+                        manager.url_by_item[item_id] = url
+                except Exception:
+                    pass
+                ok = _start_kino_item(item_id, url, _get_out_dir())
+                try:
+                    _schedule_kino_queue_save()
+                except Exception:
+                    pass
+                return ok, "queued" if ok else "failed"
+            except Exception as e:
+                return False, str(e)
+
+        class _BridgeHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args, **kwargs):
+                return
+
+            def _send(self, code: int, payload: dict):
+                try:
+                    data = json.dumps(payload).encode("utf-8")
+                except Exception:
+                    data = b"{}"
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except Exception:
+                    pass
+
+            def do_POST(self):
+                if self.path not in ("/api/kino/add", "/api/add"):
+                    self._send(404, {"error": "not_found"})
+                    return
+                if self.headers.get("X-Bridge-Token") != token:
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except Exception:
+                    length = 0
+                body = b""
+                if length > 0:
+                    try:
+                        body = self.rfile.read(length)
+                    except Exception:
+                        body = b""
+                try:
+                    payload = json.loads(body.decode("utf-8") or "{}")
+                except Exception:
+                    self._send(400, {"error": "bad_json"})
+                    return
+                url = (payload.get("url") or "").strip()
+                title = (payload.get("title") or "").strip()
+                if not url:
+                    self._send(400, {"error": "url_required"})
+                    return
+
+                done = threading.Event()
+                result = {}
+
+                def _ui():
+                    ok, msg = _enqueue_from_bridge(url, title or url)
+                    result["ok"] = ok
+                    result["msg"] = msg
+                    done.set()
+
+                try:
+                    root.after(0, _ui)
+                except Exception:
+                    _ui()
+
+                done.wait(timeout=5.0)
+                if not result.get("ok"):
+                    err = result.get("msg") or "failed"
+                    if err == "not_logged_in":
+                        self._send(409, {"error": "not_logged_in"})
+                    else:
+                        self._send(500, {"error": err})
+                    return
+                self._send(200, {"status": "ok"})
+
+        class _ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+
+        try:
+            srv = _ThreadedHTTPServer(("127.0.0.1", port), _BridgeHandler)
+        except Exception as e:
+            logging.error("Browser bridge failed to start: %s", e)
+            return
+        try:
+            root._bridge_server = srv
+        except Exception:
+            pass
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        logging.info("Browser bridge: listening on http://127.0.0.1:%s (token set)", port)
+
+    _start_browser_bridge()
 
     def _update_convert_button_state_once(*_):
         try:
@@ -5975,7 +6305,7 @@ def main():
             if not item_out_dir:
                 item_out_dir = out_dir
             try:
-                manager.start_item(item, q, item_out_dir)
+                _start_kino_item(item, q, item_out_dir)
             except Exception:
                 pass
 
@@ -7395,7 +7725,7 @@ def main():
         item_id = add_row(q, status="🟡 Подготовка...")
         kino_input.delete(0, "end")
         out_dir = _get_out_dir()
-        manager.start_item(item_id, q, out_dir)
+        _start_kino_item(item_id, q, out_dir)
         try:
             _schedule_kino_queue_save()
         except Exception:
@@ -7718,7 +8048,7 @@ def main():
             for display, url, item_out_dir in to_add:
                 item_id = add_row(display, status="🟡 Подготовка...")
                 try:
-                    manager.start_item(item_id, url, item_out_dir, name_override=display)
+                    _start_kino_item(item_id, url, item_out_dir, name_override=display)
                 except Exception:
                     try:
                         manager.url_by_item[item_id] = url
@@ -8937,7 +9267,7 @@ def main():
             if hasattr(manager, "url_by_item"):
                 manager.url_by_item[row_id] = url
 
-            manager.start_item(row_id, url, out_dir)
+            _start_kino_item(row_id, url, out_dir)
         try:
             _schedule_kino_queue_save()
         except Exception:

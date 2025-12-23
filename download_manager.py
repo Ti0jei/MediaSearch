@@ -187,11 +187,12 @@ class DownloadManager:
         preview_path = os.path.join(
             tempfile.gettempdir(), f"kinopub_preview_{uuid.uuid4().hex}.mp4"
         )
+        preview_duration = 1800  # 30 минут для более длинного прослушивания
 
         def _worker():
             ok = False
             try:
-                # Быстрый preview ~60 секунд, без перекодирования (copy).
+                # Предпросмотр (~30 минут), без перекодирования (copy).
                 cmd = [
                     ffmpeg_bin,
                     "-y",
@@ -209,7 +210,7 @@ class DownloadManager:
                     "-c",
                     "copy",
                     "-t",
-                    "60",
+                    str(preview_duration),
                     "-shortest",
                     preview_path,
                 ]
@@ -382,7 +383,7 @@ class DownloadManager:
 
                     info = ttk.Label(
                         frame,
-                        text="Предпросмотр создаёт короткий клип (~60с) и открывает ffplay. Перемотка: ←/→ (±10с), ↑/↓ (±1 мин).",
+                        text="Предпросмотр создаёт клип (~30 минут) и открывает ffplay. Перемотка: ←/→ (±10с), ↑/↓ (±1 мин).",
                     )
                     info.pack(anchor="w", pady=(8, 0))
 
@@ -419,7 +420,7 @@ class DownloadManager:
                             try:
                                 preview_btn.configure(state="normal")
                                 info.configure(
-                                    text="Предпросмотр создаёт короткий клип (~60с) и открывает ffplay. Перемотка: ←/→ (±10с), ↑/↓ (±1 мин)."
+                                    text="Предпросмотр создаёт клип (~30 минут) и открывает ffplay. Перемотка: ←/→ (±10с), ↑/↓ (±1 мин)."
                                 )
                             except Exception:
                                 pass
@@ -438,14 +439,14 @@ class DownloadManager:
                         text="Оставить выбранную",
                         command=lambda: _safe_close(_selected_index()),
                     ).pack(side="right")
-                    ttk.Button(btn_row, text="Оставить все", command=lambda: _safe_close(None)).pack(
+                    ttk.Button(btn_row, text="Оставить все", command=lambda: _safe_close("all")).pack(
                         side="right", padx=(0, 8)
                     )
                     ttk.Button(btn_row, text="Отмена", command=lambda: _safe_close("cancel")).pack(
                         side="right", padx=(0, 8)
                     )
 
-                    w.protocol("WM_DELETE_WINDOW", lambda: _safe_close(None))
+                    w.protocol("WM_DELETE_WINDOW", lambda: _safe_close("cancel"))
                 except Exception:
                     _safe_close(None)
 
@@ -463,7 +464,12 @@ class DownloadManager:
                     break
                 done.wait(timeout=0.2)
 
-            return result.get("choice")
+            choice = result.get("choice")
+            if choice == "cancel":
+                return "cancel"
+            if choice == "all":
+                return None
+            return choice
 
     # ---------- утилиты UI ----------
     def _dispatcher(self):

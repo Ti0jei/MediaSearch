@@ -1,5 +1,6 @@
 # uc_driver.py
 import os
+import json
 import time
 import threading
 from pathlib import Path
@@ -679,6 +680,64 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.by import By
 
 KINOPUB_BASE = "https://kino.pub"
+SETTINGS_FILE = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "MediaSearch", "settings.json")
+
+
+def _use_builtin_account() -> bool:
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("kino_use_builtin_account", False))
+    except Exception:
+        return False
+
+
+def _get_builtin_creds():
+    if not _use_builtin_account():
+        return None
+    return {
+        "login": "Ti0jei",
+        "password": "ea3c67f3",
+        # backup_code убран (2FA отключена)
+    }
+
+
+def _autofill_login(driver):
+    creds = _get_builtin_creds()
+    if not creds:
+        return False
+    try:
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.common.by import By
+            WebDriverWait(driver, 5).until(
+                lambda d: d.find_elements(By.CSS_SELECTOR, "#login-form-login, input[name='login-form[login]']")
+            )
+        except Exception:
+            pass
+        driver.execute_script(
+            """
+            const setVal = (sel, val) => {
+                const el = document.querySelector(sel);
+                if (el) {
+                    el.focus();
+                    el.value = val;
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+                return el;
+            };
+            setVal('#login-form-login, input[name="login-form[login]"]', arguments[0]);
+            setVal('#login-form-password, input[name="login-form[password]"]', arguments[1]);
+            const btn = document.querySelector('form#login-form button[type="submit"], form#login-form button.btn-success');
+            if (btn) btn.click();
+            """,
+            creds["login"],
+            creds["password"],
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _check_login_on(driver, status_cb=None):
@@ -750,6 +809,7 @@ def login_to_kino(status_cb=None):
     try:
         driver.get(KINOPUB_BASE + "/user/login")
         _log(status_cb, "🔓 Открыта страница входа...")
+        auto_filled_login = False
 
         # Ждём успешного логина / CF
         t0 = time.time()
@@ -757,6 +817,13 @@ def login_to_kino(status_cb=None):
         while time.time() - t0 < 300:
             url = driver.current_url.lower()
             print(f"[🔍] Текущий URL: {url}")
+
+            if "/user/login" in url:
+                try:
+                    if (not auto_filled_login) and driver.find_elements(By.CSS_SELECTOR, "#login-form-login, input[name='login-form[login]']"):
+                        auto_filled_login = _autofill_login(driver) or auto_filled_login
+                except Exception:
+                    pass
 
             # 👉 если страница логина — ждём, но не "спим" по 45 сек,
             # чтобы UI реагировал сразу после успешного входа.

@@ -12,7 +12,7 @@ import urllib.request
 from tkinter import messagebox, ttk
 
 # ==== НАСТРОЙКИ ====
-APP_VERSION = "1.0.8"  # Текущая версия приложения (меняй при релизе)
+APP_VERSION = "1.0.9"  # Текущая версия приложения (меняй при релизе)
 GITHUB_OWNER = "Ti0jei"  # Твой GitHub
 GITHUB_REPO = "MediaSearch"  # Репозиторий
 INSTALL_ARGS = []  # Например ['/VERYSILENT'] для тихой установки
